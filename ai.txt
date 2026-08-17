@@ -1,0 +1,494 @@
+# ---------------------- HELPER: GET CUSTOMER DATA WITH ORDER/DEMAND ----------------------
+def get_customer_data_with_order_demand(production_order_code, production_demand_code):
+    """
+    Fetch customer data and ensure we have proper order and demand codes
+    """
+    try:
+        customer_data = fetch_customer_data(production_order_code, production_demand_code)
+        
+        if customer_data:
+            # Ensure we have valid values
+            customer_name = customer_data.get('CustomerName', '').strip()
+            customer_po = customer_data.get('CustomerPO', '').strip()
+            
+            # If PO is empty or '-', use a default
+            if not customer_po or customer_po == '-':
+                customer_po = 'NONE'
+            
+            # If customer name is empty, use UNKNOWN
+            if not customer_name:
+                customer_name = 'UNKNOWN'
+            
+            return {
+                'CustomerName': customer_name,
+                'CustomerPO': customer_po,
+                'CustomerCode': customer_data.get('CustomerCode', 'UNKNOWN'),
+                'OrderCode': production_order_code,
+                'DemandCode': production_demand_code
+            }
+        else:
+            # No customer data found, use defaults with order/demand codes
+            return {
+                'CustomerName': 'UNKNOWN',
+                'CustomerPO': 'NONE',
+                'CustomerCode': 'UNKNOWN',
+                'OrderCode': production_order_code,
+                'DemandCode': production_demand_code
+            }
+            
+    except Exception as e:
+        print(f"Error fetching customer data: {e}")
+        return {
+            'CustomerName': 'UNKNOWN',
+            'CustomerPO': 'NONE',
+            'CustomerCode': 'UNKNOWN',
+            'OrderCode': production_order_code,
+            'DemandCode': production_demand_code
+        }
+
+
+# ---------------------- UPDATED: BUILD IMAGE URL WITH PROPER DATA ----------------------
+def build_image_url(element, customer_data, product_details, production_order_code, production_demand_code, pallet_number, box_number, kit_elements=None):
+    """Generate media path with proper customer, order, and demand data"""
+    import re
+    
+    # Get customer data with order and demand
+    customer_info = get_customer_data_with_order_demand(production_order_code, production_demand_code)
+    
+    customer_name = customer_info.get('CustomerName', 'UNKNOWN').strip()
+    customer_po = customer_info.get('CustomerPO', 'NONE').strip()
+    order_clean = production_order_code.strip().upper()
+    demand_clean = production_demand_code.strip().upper()
+    
+    # Clean customer name and PO
+    customer_clean = re.sub(r'[^\w\s-]', '', customer_name).strip().upper()
+    if not customer_clean:
+        customer_clean = 'UNKNOWN'
+    customer_slug = customer_clean.replace(' ', '-').replace('--', '-')
+    
+    po_clean = customer_po.upper()
+    if not po_clean or po_clean == '-':
+        po_clean = 'NONE'
+    
+    # If product_details is None, use empty dict
+    if product_details is None:
+        product_details = {}
+    
+    # Extract PressurBal, PL1, and packing_sequence
+    pressur_bal, pl1, packing_sequence = extract_pressur_bal_and_pl1(product_details, kit_elements)
+    
+    # Clean pressur_bal
+    pressur_bal_clean = re.sub(r'\D', '', str(pressur_bal)) or '1'
+    
+    # Get subcode03 for folder naming
+    subcode03 = product_details.get('Subcode03', '').strip()
+    if not subcode03:
+        subcode03 = pressur_bal_clean
+    
+    # Use packing_sequence for box folder
+    if packing_sequence and packing_sequence != 'N/A':
+        box_folder_value = re.sub(r'[^\w\-]', '', packing_sequence).strip()
+        if not box_folder_value:
+            box_folder_value = pl1
+    else:
+        box_folder_value = pl1
+    
+    # Clean pallet and box numbers
+    pallet_clean = str(pallet_number).strip().upper()
+    box_clean = str(box_number).strip().upper()
+    
+    # Build demand folder
+    demand_folder = f"{demand_clean}_{subcode03}"
+    
+    # Build the full folder structure
+    folder_structure = f"{customer_slug}--{po_clean}/{order_clean}/{demand_folder}/PALLET_{pallet_clean}_{subcode03}/BOX_{box_clean}_{box_folder_value}"
+    
+    print(f"[FOLDER] Generated folder: {folder_structure}")
+    return folder_structure, None
+
+
+# ---------------------- UPDATED: BUILD COMMON FOLDER PATH ----------------------
+def build_common_folder_path(customer_data, product_details, production_order_code, production_demand_code, pallet_number, box_number, kit_elements=None):
+    """Generate common folder path structure using proper data"""
+    import re
+    
+    # Get customer data with order and demand
+    customer_info = get_customer_data_with_order_demand(production_order_code, production_demand_code)
+    
+    customer_name = customer_info.get('CustomerName', 'UNKNOWN').strip()
+    customer_po = customer_info.get('CustomerPO', 'NONE').strip()
+    order_clean = production_order_code.strip().upper()
+    demand_clean = production_demand_code.strip().upper()
+    
+    # Clean customer name and PO
+    customer_clean = re.sub(r'[^\w\s-]', '', customer_name).strip().upper()
+    if not customer_clean:
+        customer_clean = 'UNKNOWN'
+    customer_slug = customer_clean.replace(' ', '-').replace('--', '-')
+    
+    po_clean = customer_po.upper()
+    if not po_clean or po_clean == '-':
+        po_clean = 'NONE'
+    
+    if product_details is None:
+        product_details = {}
+    
+    pressur_bal, pl1, packing_sequence = extract_pressur_bal_and_pl1(product_details, kit_elements)
+    
+    # Clean pressur_bal
+    pressur_bal_clean = re.sub(r'\D', '', str(pressur_bal)) or '1'
+    
+    # Get subcode03
+    subcode03 = product_details.get('Subcode03', '').strip()
+    if not subcode03:
+        subcode03 = pressur_bal_clean
+    
+    # Use packing_sequence for box folder
+    if packing_sequence and packing_sequence != 'N/A':
+        box_folder_value = re.sub(r'[^\w\-]', '', packing_sequence).strip()
+        if not box_folder_value:
+            box_folder_value = pl1
+    else:
+        box_folder_value = pl1
+    
+    # Clean pallet and box numbers
+    pallet_clean = str(pallet_number).strip().upper()
+    box_clean = str(box_number).strip().upper()
+    
+    # Build demand folder
+    demand_folder = f"{demand_clean}_{subcode03}"
+    
+    # Build folder path
+    folder_path = f"{customer_slug}--{po_clean}/{order_clean}/{demand_folder}/PALLET_{pallet_clean}_{subcode03}/BOX_{box_clean}_{box_folder_value}"
+    
+    return folder_path
+
+
+# ---------------------- UPDATED: FETCH DATA VIEW ----------------------
+def fetch_data(request):
+    if request.method == 'POST':
+        production_order_code = request.POST.get('production_order_code', '').strip()
+        production_demand_code = request.POST.get('production_demand_code', '').strip()
+        pallet_number = request.POST.get('pallet_number', '1').strip()
+        box_number = request.POST.get('box_number', '1').strip()
+
+        # Fetch all data
+        customer_data = fetch_customer_data(production_order_code, production_demand_code)
+        product_details = fetch_product_details(production_order_code, production_demand_code)
+        kit_elements = fetch_kit_elements(production_order_code, production_demand_code, pallet_number, box_number)
+        
+        # Get customer info with order/demand
+        customer_info = get_customer_data_with_order_demand(production_order_code, production_demand_code)
+        
+        # Extract PressurBal, PL1 and packing_sequence
+        pressur_bal, pl1, packing_sequence = extract_pressur_bal_and_pl1(product_details, kit_elements)
+        print(f"Extracted PressurBal: {pressur_bal}, PL1: {pl1}, PackingSeq: {packing_sequence}")
+        
+        if product_details:
+            product_details['PressurBal'] = pressur_bal
+            product_details['PL1'] = pl1
+            product_details['PackingSequence'] = packing_sequence
+
+        # Process each element for element images
+        for element in kit_elements:
+            folder_structure, element_slug = build_image_url(
+                element, 
+                customer_data if customer_data else {}, 
+                product_details if product_details else {}, 
+                production_order_code, 
+                production_demand_code, 
+                pallet_number, 
+                box_number,
+                kit_elements
+            )
+            
+            # Store folder structure in element for later use
+            element['folder_structure'] = folder_structure
+            
+            element_desc = element.get('ELEMENTDESC', '').strip()
+            image_url = check_image_exists(folder_structure, element_desc, element_desc)
+            if image_url:
+                element['image_url'] = image_url
+                element['has_image'] = True
+            else:
+                element['image_url'] = None
+                element['has_image'] = False
+        
+        # Process each element's human image separately
+        for element in kit_elements:
+            current_ply = element.get('ELEMENTDESC', '').strip()
+            
+            if current_ply:
+                # Use the folder_structure already stored in element
+                folder_structure = element.get('folder_structure', '')
+                
+                if not folder_structure:
+                    # Fallback: rebuild folder structure
+                    folder_structure, _ = build_image_url(
+                        element, 
+                        customer_data if customer_data else {}, 
+                        product_details if product_details else {}, 
+                        production_order_code, 
+                        production_demand_code, 
+                        pallet_number, 
+                        box_number,
+                        kit_elements
+                    )
+                
+                # Use folder_structure directly without human_faces prefix
+                human_image_url = check_human_image_exists(folder_structure, current_ply)
+                
+                # Store human image info in element
+                element['human_image_url'] = human_image_url
+                element['has_human_image'] = human_image_url is not None
+                element['human_folder'] = folder_structure
+            else:
+                element['human_image_url'] = None
+                element['has_human_image'] = False
+
+        # Use customer_info for display
+        display_customer = {
+            'CustomerName': customer_info.get('CustomerName', 'Not Available'),
+            'CustomerPO': customer_info.get('CustomerPO', 'Not Available'),
+            'CustomerCode': customer_data.get('CustomerCode', 'Not Available') if customer_data else 'Not Available'
+        }
+        
+        context = {
+            'customer_data': display_customer,
+            'product_details': product_details if product_details else {
+                'ItemType': 'Not Available',
+                'Subcode01': 'N/A',
+                'Subcode02': 'N/A',
+                'Subcode03': 'N/A',
+                'Subcode04': 'N/A',
+                'Subcode05': 'N/A',
+                'PressurBal': '',
+                'PL1': '',
+                'PackingSequence': ''
+            },
+            'kit_elements': kit_elements or [],
+            'production_order_code': production_order_code,
+            'production_demand_code': production_demand_code,
+            'pallet_number': pallet_number,
+            'box_number': box_number,
+            'packing_sequence': packing_sequence,
+            'MEDIA_URL': settings.MEDIA_URL
+        }
+
+        if not any([customer_data, product_details, kit_elements]):
+            context['error'] = "No data found for the provided codes"
+            return render(request, 'fetch_data.html', context)
+
+        return render(request, 'view_data.html', context)
+
+    return render(request, 'fetch_data.html')
+
+
+# ---------------------- UPDATED: VIEW DATA ----------------------
+def view_data(request):
+    if request.method == 'POST':
+        production_order_code = request.POST.get('production_order_code', '').strip()
+        production_demand_code = request.POST.get('production_demand_code', '').strip()
+        pallet_number = request.POST.get('pallet_number', '1').strip()
+        box_number = request.POST.get('box_number', '1').strip()
+
+        customer_data = fetch_customer_data(production_order_code, production_demand_code)
+        product_details = fetch_product_details(production_order_code, production_demand_code)
+        kit_elements = fetch_kit_elements(production_order_code, production_demand_code, pallet_number, box_number)
+        
+        # Get customer info with order/demand
+        customer_info = get_customer_data_with_order_demand(production_order_code, production_demand_code)
+        
+        # Extract PressurBal, PL1 and packing_sequence
+        pressur_bal, pl1, packing_sequence = extract_pressur_bal_and_pl1(product_details, kit_elements)
+        
+        if product_details:
+            product_details['PressurBal'] = pressur_bal
+            product_details['PL1'] = pl1
+            product_details['PackingSequence'] = packing_sequence
+
+        for element in kit_elements:
+            folder_structure, element_slug = build_image_url(
+                element, 
+                customer_data if customer_data else {}, 
+                product_details if product_details else {}, 
+                production_order_code, 
+                production_demand_code, 
+                pallet_number, 
+                box_number,
+                kit_elements
+            )
+            
+            element['folder_structure'] = folder_structure
+            
+            element_desc = element.get('ELEMENTDESC', '').strip()
+            image_url = check_image_exists(folder_structure, element_desc, element_desc)
+            if image_url:
+                element['image_url'] = image_url
+                element['has_image'] = True
+            else:
+                element['image_url'] = None
+                element['has_image'] = False
+        
+        # Process each element's human image separately
+        for element in kit_elements:
+            current_ply = element.get('ELEMENTDESC', '').strip()
+            
+            if current_ply:
+                folder_structure = element.get('folder_structure', '')
+                
+                if not folder_structure:
+                    folder_structure, _ = build_image_url(
+                        element, 
+                        customer_data if customer_data else {}, 
+                        product_details if product_details else {}, 
+                        production_order_code, 
+                        production_demand_code, 
+                        pallet_number, 
+                        box_number,
+                        kit_elements
+                    )
+                
+                human_image_url = check_human_image_exists(folder_structure, current_ply)
+                
+                element['human_image_url'] = human_image_url
+                element['has_human_image'] = human_image_url is not None
+                element['human_folder'] = folder_structure
+            else:
+                element['human_image_url'] = None
+                element['has_human_image'] = False
+
+        # Use customer_info for display
+        display_customer = {
+            'CustomerName': customer_info.get('CustomerName', 'Not Available'),
+            'CustomerPO': customer_info.get('CustomerPO', 'Not Available'),
+            'CustomerCode': customer_data.get('CustomerCode', 'Not Available') if customer_data else 'Not Available'
+        }
+
+        context = {
+            'customer_data': display_customer,
+            'product_details': product_details if product_details else {
+                'ItemType': 'Not Available',
+                'Subcode01': 'N/A',
+                'Subcode02': 'N/A',
+                'Subcode03': 'N/A',
+                'Subcode04': 'N/A',
+                'Subcode05': 'N/A',
+                'PressurBal': '',
+                'PL1': '1',
+                'PackingSequence': ''
+            },
+            'kit_elements': kit_elements or [],
+            'production_order_code': production_order_code,
+            'production_demand_code': production_demand_code,
+            'pallet_number': pallet_number,
+            'box_number': box_number,
+            'packing_sequence': packing_sequence,
+            'MEDIA_URL': settings.MEDIA_URL
+        }
+
+        return render(request, 'view_data.html', context)
+
+    # GET request handling
+    production_order_code = request.GET.get('production_order_code', '').strip()
+    production_demand_code = request.GET.get('production_demand_code', '').strip()
+    pallet_number = request.GET.get('pallet_number', '1').strip()
+    box_number = request.GET.get('box_number', '1').strip()
+
+    if production_order_code and production_demand_code:
+        customer_data = fetch_customer_data(production_order_code, production_demand_code)
+        product_details = fetch_product_details(production_order_code, production_demand_code)
+        kit_elements = fetch_kit_elements(production_order_code, production_demand_code, pallet_number, box_number)
+        
+        # Get customer info with order/demand
+        customer_info = get_customer_data_with_order_demand(production_order_code, production_demand_code)
+        
+        pressur_bal, pl1, packing_sequence = extract_pressur_bal_and_pl1(product_details, kit_elements)
+        
+        if product_details:
+            product_details['PressurBal'] = pressur_bal
+            product_details['PL1'] = pl1
+            product_details['PackingSequence'] = packing_sequence
+
+        for element in kit_elements:
+            folder_structure, element_slug = build_image_url(
+                element, 
+                customer_data if customer_data else {}, 
+                product_details if product_details else {}, 
+                production_order_code, 
+                production_demand_code, 
+                pallet_number, 
+                box_number,
+                kit_elements
+            )
+            
+            element['folder_structure'] = folder_structure
+            
+            element_desc = element.get('ELEMENTDESC', '').strip()
+            image_url = check_image_exists(folder_structure, element_desc, element_desc)
+            if image_url:
+                element['image_url'] = image_url
+                element['has_image'] = True
+            else:
+                element['image_url'] = None
+                element['has_image'] = False
+        
+        for element in kit_elements:
+            current_ply = element.get('ELEMENTDESC', '').strip()
+            
+            if current_ply:
+                folder_structure = element.get('folder_structure', '')
+                
+                if not folder_structure:
+                    folder_structure, _ = build_image_url(
+                        element, 
+                        customer_data if customer_data else {}, 
+                        product_details if product_details else {}, 
+                        production_order_code, 
+                        production_demand_code, 
+                        pallet_number, 
+                        box_number,
+                        kit_elements
+                    )
+                
+                human_image_url = check_human_image_exists(folder_structure, current_ply)
+                
+                element['human_image_url'] = human_image_url
+                element['has_human_image'] = human_image_url is not None
+                element['human_folder'] = folder_structure
+            else:
+                element['human_image_url'] = None
+                element['has_human_image'] = False
+
+        # Use customer_info for display
+        display_customer = {
+            'CustomerName': customer_info.get('CustomerName', 'Not Available'),
+            'CustomerPO': customer_info.get('CustomerPO', 'Not Available'),
+            'CustomerCode': customer_data.get('CustomerCode', 'Not Available') if customer_data else 'Not Available'
+        }
+
+        context = {
+            'customer_data': display_customer,
+            'product_details': product_details if product_details else {
+                'ItemType': 'Not Available',
+                'Subcode01': 'N/A',
+                'Subcode02': 'N/A',
+                'Subcode03': 'N/A',
+                'Subcode04': 'N/A',
+                'Subcode05': 'N/A',
+                'PressurBal': '',
+                'PL1': '1',
+                'PackingSequence': ''
+            },
+            'kit_elements': kit_elements or [],
+            'production_order_code': production_order_code,
+            'production_demand_code': production_demand_code,
+            'pallet_number': pallet_number,
+            'box_number': box_number,
+            'packing_sequence': packing_sequence,
+            'MEDIA_URL': settings.MEDIA_URL
+        }
+
+        return render(request, 'view_data.html', context)
+
+    return render(request, 'fetch_data.html')
