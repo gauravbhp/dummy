@@ -1,0 +1,5 @@
+need:  folder_path = f"{customer_slug}--{po_clean}/{order_clean}/{demand_folder}/PALLET_{pallet_clean}_{subcode03}/BOX_{box_clean}_{box_folder_value}"
+
+you are giving this UNKNOWN--NONE\ANIL78.6\SHELL_PRESSURE\PALLET_1_PRESSURE\BOX_14_PT1
+
+here pallet and box value are correct from UI take Order code and Demand code ok and customer_name and PO from db ok 
