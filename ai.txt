@@ -1,147 +1,520 @@
-# ---------------------- HELPER: GET CUSTOMER DATA WITH ORDER/DEMAND ----------------------
-def get_customer_data_with_order_demand(production_order_code, production_demand_code):
-    """
-    Fetch customer data and ensure we have proper order and demand codes
-    """
-    try:
-        customer_data = fetch_customer_data(production_order_code, production_demand_code)
-        
-        if customer_data:
-            # Ensure we have valid values
-            customer_name = customer_data.get('CustomerName', '').strip()
-            customer_po = customer_data.get('CustomerPO', '').strip()
-            
-            # If PO is empty or '-', use a default
-            if not customer_po or customer_po == '-':
-                customer_po = 'NONE'
-            
-            # If customer name is empty, use UNKNOWN
-            if not customer_name:
-                customer_name = 'UNKNOWN'
-            
-            return {
-                'CustomerName': customer_name,
-                'CustomerPO': customer_po,
-                'CustomerCode': customer_data.get('CustomerCode', 'UNKNOWN'),
-                'OrderCode': production_order_code,
-                'DemandCode': production_demand_code
-            }
-        else:
-            # No customer data found, use defaults with order/demand codes
-            return {
-                'CustomerName': 'UNKNOWN',
-                'CustomerPO': 'NONE',
-                'CustomerCode': 'UNKNOWN',
-                'OrderCode': production_order_code,
-                'DemandCode': production_demand_code
-            }
-            
-    except Exception as e:
-        print(f"Error fetching customer data: {e}")
-        return {
-            'CustomerName': 'UNKNOWN',
-            'CustomerPO': 'NONE',
-            'CustomerCode': 'UNKNOWN',
-            'OrderCode': production_order_code,
-            'DemandCode': production_demand_code
-        }
 
 
-# ---------------------- UPDATED: BUILD IMAGE URL WITH PROPER DATA ----------------------
-def build_image_url(element, customer_data, product_details, production_order_code, production_demand_code, pallet_number, box_number, kit_elements=None):
-    """Generate media path with proper customer, order, and demand data"""
-    import re
+
+import os
+import shutil
+import re
+import logging
+from pathlib import Path
+from datetime import datetime
+from django.conf import settings
+from .utils.db_queries import fetch_customer_data, fetch_product_details, fetch_kit_elements, get_db_connection
+import ibm_db
+from datetime import datetime
+import json
+import base64
+import time
+from django.shortcuts import render, redirect
+from django.urls import reverse
+from django.contrib import messages
+from django.views.decorators.csrf import csrf_exempt
+from django.http import JsonResponse
+from django.utils.text import slugify
+from .utils.db_queries import fetch_customer_data, fetch_product_details, fetch_kit_elements
+import ibm_db
+from .utils.db_queries import get_db_connection
+from django.views.decorators.http import require_GET, require_POST
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Paths
+SOURCE_DIR = r"E:\Onedrive_it_intern\OneDrive - SKAPS INDUSTRIES INDIA PVT.LTD\Jay Vyas's files - Images from Server\Results From Bot"
+DESTINATION_BASE = r"\\192.168.4.32\testKit"
+
+# ---------------------- HELPER: LOG TIME INFORMATION ----------------------
+def log_time_info(log_type, start_time, end_time, element_desc, production_order_code, production_demand_code, 
+                  customer_data, folder_structure, pallet_number, box_number, is_human_image=False, status="success"):
+    """
+    Log time information to a text file
     
-    # Get customer data with order and demand
-    customer_info = get_customer_data_with_order_demand(production_order_code, production_demand_code)
+    Args:
+        log_type: 'capture_to_upload' or 'upload_duration'
+        start_time: Start time (datetime object or timestamp)
+        end_time: End time (datetime object or timestamp)
+        element_desc: Element description
+        production_order_code: Production order code
+        production_demand_code: Production demand code
+        customer_data: Customer data dictionary
+        folder_structure: Folder structure path
+        pallet_number: Pallet number
+        box_number: Box number
+        is_human_image: Boolean indicating if it's human image
+        status: Status of operation ('success', 'failed', 'cancelled')
+    """
     
-    customer_name = customer_info.get('CustomerName', 'UNKNOWN').strip()
-    customer_po = customer_info.get('CustomerPO', 'NONE').strip()
+    # Create logs directory if it doesn't exist
+    logs_dir = os.path.join(settings.BASE_DIR, 'logs')
+    os.makedirs(logs_dir, exist_ok=True)
+    
+    # Log filename based on date
+    today = datetime.now().strftime('%Y-%m-%d')
+    log_filename = f"image_upload_times_{today}.txt"
+    log_filepath = os.path.join(logs_dir, log_filename)
+    
+    # Calculate duration
+    if isinstance(start_time, (int, float)):
+        # If timestamp
+        duration = end_time - start_time if isinstance(end_time, (int, float)) else None
+        start_datetime = datetime.fromtimestamp(start_time)
+        end_datetime = datetime.fromtimestamp(end_time)
+    else:
+        # If datetime objects
+        duration = (end_time - start_time).total_seconds() if end_time and start_time else None
+        start_datetime = start_time
+        end_datetime = end_time
+    
+    # Get clean values for logging
+    customer_name = customer_data.get('CustomerName', 'UNKNOWN').strip() if customer_data else 'UNKNOWN'
+    customer_po = customer_data.get('CustomerPO', 'NONE').strip() if customer_data else 'NONE'
+    
+    # Clean values
+    customer_name_clean = re.sub(r'[^\w\s-]', '', customer_name).strip().upper()
+    customer_po_clean = customer_po.upper()
     order_clean = production_order_code.strip().upper()
     demand_clean = production_demand_code.strip().upper()
+    pallet_clean = str(pallet_number).strip().upper()
+    box_clean = str(box_number).strip().upper()
     
-    # Clean customer name and PO
+    # Extract PL value from folder structure or use default
+    pl_match = re.search(r'BOX_\d+_(\d+)', folder_structure) if folder_structure else None
+    pl_clean = pl_match.group(1) if pl_match else '1'
+    
+    # Create log entry
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    image_type = "Human Image" if is_human_image else "Element Image"
+    
+    log_entry = f"""
+{'='*80}
+[{timestamp}] {log_type.upper()} - {image_type}
+{'='*80}
+
+Image Details:
+-------------
+Element Description: {element_desc}
+Image Type: {image_type}
+Status: {status.upper()}
+
+Order Information:
+----------------
+Order Code: {order_clean}
+Demand Code: {demand_clean}
+
+Customer Information:
+====================
+Customer: {customer_name_clean}
+PO: {customer_po_clean}
+
+Container Information:
+=====================
+Pallet: {pallet_clean}
+Box: {box_clean}
+PL: {pl_clean}
+
+Time Information:
+===============
+Start Time (Capture): {start_datetime.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] if start_datetime else 'N/A'}
+End Time (Upload): {end_datetime.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] if end_datetime else 'N/A'}
+Total Duration: {duration:.3f} seconds ({duration/60:.2f} minutes) if duration else 'N/A'
+
+System Information:
+==================
+Folder Path: {folder_structure}
+Log Created: {timestamp}
+
+{'='*80}
+
+"""
+    
+    # Write to log file
+    try:
+        with open(log_filepath, 'a', encoding='utf-8') as log_file:
+            log_file.write(log_entry)
+        print(f"[TIME LOG] Successfully logged to: {log_filepath}")
+        return True
+    except Exception as e:
+        print(f"[TIME LOG ERROR] Failed to write log: {e}")
+        return False
+
+def log_time_to_text_file(log_data):
+    """
+    Save time tracking information to a text file
+    
+    Args:
+        log_data: Dictionary containing all timing information
+    """
+    # Create logs directory if it doesn't exist
+    logs_dir = os.path.join(settings.BASE_DIR, 'logs')
+    os.makedirs(logs_dir, exist_ok=True)
+    
+    # Create filename with date
+    today = datetime.now().strftime('%Y-%m-%d')
+    log_filename = f"capture_upload_times_{today}.txt"
+    log_filepath = os.path.join(logs_dir, log_filename)
+    
+    # Format the log entry
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    log_entry = f"""
+{'='*80}
+LOG ENTRY: {timestamp}
+{'='*80}
+
+IMAGE DETAILS:
+--------------
+Element Description: {log_data.get('element_desc', 'N/A')}
+Image Type: {log_data.get('image_type', 'N/A')}
+Status: {log_data.get('status', 'N/A')}
+
+ORDER INFORMATION:
+-----------------
+Order Code: {log_data.get('order_code', 'N/A')}
+Demand Code: {log_data.get('demand_code', 'N/A')}
+
+CUSTOMER INFORMATION:
+====================
+Customer: {log_data.get('customer_name', 'N/A')}
+PO: {log_data.get('customer_po', 'N/A')}
+
+CONTAINER INFORMATION:
+=====================
+Pallet: {log_data.get('pallet_number', 'N/A')}
+Box: {log_data.get('box_number', 'N/A')}
+PL: {log_data.get('pl_value', 'N/A')}
+
+TIME INFORMATION:
+================
+Capture Start Time: {log_data.get('capture_start_time', 'N/A')}
+Back Image Capture Time: {log_data.get('back_capture_time', 'N/A')}
+Front Image Capture Time: {log_data.get('front_capture_time', 'N/A')}
+Upload Start Time: {log_data.get('upload_start_time', 'N/A')}
+Upload Complete Time: {log_data.get('upload_complete_time', 'N/A')}
+
+DURATIONS:
+----------
+Total Duration (Capture to Upload): {log_data.get('total_duration', 'N/A')} seconds
+Back Capture Duration: {log_data.get('back_capture_duration', 'N/A')} seconds
+Front Capture Duration: {log_data.get('front_capture_duration', 'N/A')} seconds
+Between Captures Duration: {log_data.get('between_captures_duration', 'N/A')} seconds
+Upload Processing Duration: {log_data.get('upload_duration', 'N/A')} seconds
+
+SYSTEM INFORMATION:
+==================
+Folder Path: {log_data.get('folder_path', 'N/A')}
+IP Address: {log_data.get('ip_address', 'N/A')}
+User Agent: {log_data.get('user_agent', 'N/A')}
+
+{'='*80}
+
+"""
+    
+    # Write to log file
+    try:
+        with open(log_filepath, 'a', encoding='utf-8') as log_file:
+            log_file.write(log_entry)
+        print(f"[TIME LOG] Successfully saved to: {log_filepath}")
+        return True
+    except Exception as e:
+        print(f"[TIME LOG ERROR] Failed to write log: {e}")
+        return False 
+
+# ---------------------- TEST LOGGING ENDPOINT ----------------------
+@csrf_exempt
+def test_logging(request):
+    """Test endpoint to verify logging is working"""
+    if request.method == 'GET':
+        try:
+            test_log = log_capture_time_simple(
+                element_desc="TEST_IMAGE",
+                order_code="TEST_ORDER",
+                demand_code="TEST_DEMAND",
+                pallet_number="1",
+                box_number="1",
+                capture_start=datetime.now().isoformat(),
+                upload_complete=datetime.now().isoformat(),
+                status="test",
+                extra_data="This is a test log entry"
+            )
+            
+            if test_log:
+                return JsonResponse({'status': 'success', 'message': 'Test log created successfully'})
+            else:
+                return JsonResponse({'status': 'error', 'message': 'Failed to create log'}, status=500)
+        except Exception as e:
+            return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+    return JsonResponse({'status': 'error', 'message': 'Use GET request'}, status=405)
+
+@csrf_exempt
+def save_timing_log_endpoint(request):
+    """Simple endpoint to save timing log from frontend"""
+    if request.method == 'POST':
+        try:
+            # Try to get JSON data
+            try:
+                data = json.loads(request.body)
+            except:
+                data = request.POST.dict()
+            
+            # Extract data
+            element_desc = data.get('element_desc', 'Unknown')
+            order_code = data.get('order_code', '')
+            demand_code = data.get('demand_code', '')
+            pallet_number = data.get('pallet_number', '')
+            box_number = data.get('box_number', '')
+            capture_start = data.get('capture_start_time', '')
+            upload_complete = data.get('upload_complete_time', datetime.now().isoformat())
+            status = data.get('status', 'completed')
+            
+            # Log to text file
+            log_capture_time_simple(
+                element_desc=element_desc,
+                order_code=order_code,
+                demand_code=demand_code,
+                pallet_number=pallet_number,
+                box_number=box_number,
+                capture_start=capture_start,
+                upload_complete=upload_complete,
+                status=status,
+                extra_data=data.get('extra_data', '')
+            )
+            
+            return JsonResponse({'status': 'success', 'message': 'Log saved'})
+        except Exception as e:
+            return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+    
+    return JsonResponse({'status': 'error', 'message': 'Invalid method'}, status=405)
+
+# ---------------------- HELPER: EXTRACT PRESSURBAL AND PL1 ----------------------
+def extract_pressur_bal_and_pl1(product_details, kit_elements=None):
+    """
+    Extract PressurBal and PL1 values from subcodes or kit elements
+    
+    Args:
+        product_details: Dictionary with Subcode01-10 values
+        kit_elements: List of kit element dictionaries from fetch_kit_elements()
+    
+    Returns:
+        tuple: (pressur_bal, pl1, packing_sequence)
+    """
+    pressur_bal = None
+    pl1 = None
+    packing_sequence = None
+    
+    print("\n[EXTRACT] Starting extraction...")
+    
+    # ========== EXTRACT PL1 AND PACKINGSEQUENCE FROM KIT ELEMENTS ==========
+    if kit_elements and len(kit_elements) > 0:
+        print(f"[EXTRACT] Checking {len(kit_elements)} kit elements...")
+        for kit in kit_elements:
+            # Get PACKINGSEQUENCE value
+            packing_sequence = kit.get('PACKINGSEQUENCE', '').strip()
+            if packing_sequence and packing_sequence != 'N/A':
+                print(f"[EXTRACT] Found PACKINGSEQUENCE: '{packing_sequence}'")
+                
+                # Check for PL1, PL2, PL3, etc.
+                match = re.search(r'PL(\d+)', packing_sequence.upper())
+                if match:
+                    pl1 = match.group(1)
+                    print(f"[EXTRACT] PL1 extracted from PACKINGSEQUENCE: {pl1}")
+                    break
+                elif 'PL' in packing_sequence.upper():
+                    pl1 = '1'
+                    print(f"[EXTRACT] PL found (no number) from PACKINGSEQUENCE, default: {pl1}")
+                    break
+                else:
+                    # If no PL found, use the entire packing_sequence as box identifier
+                    print(f"[EXTRACT] Using PACKINGSEQUENCE as box identifier: {packing_sequence}")
+                    break
+    
+    # ========== EXTRACT PL1 FROM PRODUCT DETAILS (Fallback) ==========
+    if pl1 is None and product_details:
+        print("[EXTRACT] PL1 not in kit elements, checking product details...")
+        
+        # Check all Subcode fields
+        for i in range(1, 11):
+            subcode_key = f'Subcode{str(i).zfill(2)}'
+            subcode_value = product_details.get(subcode_key, '').strip()
+            
+            if subcode_value and subcode_value != 'N/A':
+                print(f"[EXTRACT] Checking {subcode_key}: '{subcode_value}'")
+                
+                # Check for PL pattern
+                if 'PL1' in subcode_value.upper():
+                    match = re.search(r'PL1\s*(\d+)?', subcode_value.upper())
+                    if match and match.group(1):
+                        pl1 = match.group(1)
+                    else:
+                        pl1 = '1'
+                    print(f"[EXTRACT] PL1 found in {subcode_key}: {pl1}")
+                    break
+                elif 'PL' in subcode_value.upper():
+                    match = re.search(r'PL\s*(\d+)', subcode_value.upper())
+                    if match:
+                        pl1 = match.group(1)
+                        print(f"[EXTRACT] PL found in {subcode_key}: {pl1}")
+                        break
+                # Check for plain digits <= 3 (legacy support)
+                elif subcode_value.isdigit() and len(subcode_value) <= 3:
+                    if pl1 is None:
+                        pl1 = subcode_value
+                        print(f"[EXTRACT] Numeric PL1 from {subcode_key}: {pl1}")
+    
+    # ========== EXTRACT PRESSURBAL FROM PRODUCT DETAILS ==========
+    if product_details:
+        # Check Subcode03 first (most common location)
+        subcode03 = product_details.get('Subcode03', '').strip()
+        print(f"[EXTRACT] Checking Subcode03 for PRESSURBAL: '{subcode03}'")
+        
+        if subcode03 and subcode03 != 'N/A':
+            if 'PRESSURBAL' in subcode03.upper():
+                match = re.search(r'PRESSURBAL\s*(\d+)', subcode03.upper())
+                if match:
+                    pressur_bal = match.group(1)
+                    print(f"[EXTRACT] PRESSURBAL found in Subcode03: {pressur_bal}")
+                else:
+                    pressur_bal = subcode03
+                    print(f"[EXTRACT] Using Subcode03 as pressur_bal: {pressur_bal}")
+            else:
+                pressur_bal = subcode03
+                print(f"[EXTRACT] Using Subcode03 as pressur_bal: {pressur_bal}")
+        
+        # If not found in Subcode03, check other subcodes
+        if pressur_bal is None:
+            for i in range(1, 11):
+                subcode_key = f'Subcode{str(i).zfill(2)}'
+                if subcode_key != 'Subcode03':
+                    subcode_value = product_details.get(subcode_key, '').strip()
+                    if subcode_value and subcode_value != 'N/A':
+                        if 'PRESSURBAL' in subcode_value.upper():
+                            match = re.search(r'PRESSURBAL\s*(\d+)', subcode_value.upper())
+                            if match:
+                                pressur_bal = match.group(1)
+                                print(f"[EXTRACT] PRESSURBAL found in {subcode_key}: {pressur_bal}")
+                                break
+    
+    # ========== EXTRACT PRESSURBAL FROM KIT ELEMENTS (Fallback) ==========
+    if pressur_bal is None and kit_elements:
+        print("[EXTRACT] Checking kit elements for pressure info...")
+        for kit in kit_elements:
+            element_desc = kit.get('ELEMENTDESC', '').strip()
+            if element_desc and 'PRESSURE' in element_desc.upper():
+                match = re.search(r'(\d+)', element_desc)
+                if match:
+                    pressur_bal = match.group(1)
+                    print(f"[EXTRACT] Pressure found in ELEMENTDESC: {pressur_bal}")
+                    break
+    
+    # ========== APPLY DEFAULTS IF NEEDED ==========
+    if pressur_bal is None:
+        pressur_bal = '1'
+        print("[EXTRACT] Using default pressur_bal: 1")
+    
+    if pl1 is None:
+        pl1 = '1'
+        print("[EXTRACT] Using default pl1: 1")
+    
+    # If no packing_sequence found, use pl1 as fallback
+    if not packing_sequence:
+        packing_sequence = pl1
+    
+    print(f"[EXTRACT] FINAL - PressurBal: {pressur_bal}, PL1: {pl1}, PackingSeq: {packing_sequence}\n")
+    return pressur_bal, pl1, packing_sequence
+
+# ---------------------- HELPER: BUILD IMAGE URL ----------------------
+def build_image_url(element, customer_data, product_details, production_order_code, production_demand_code, pallet_number, box_number, kit_elements=None):
+    """Generate media path with new structure using PACKINGSEQUENCE"""
+    import re
+    
+    if customer_data is None:
+        customer_data = {}
+        
+    customer_name = customer_data.get('CustomerName', '').strip() if customer_data.get('CustomerName') else 'UNKNOWN'
+    customer_po = customer_data.get('CustomerPO', '').strip() if customer_data.get('CustomerPO') else 'NONE'
+    
+    if not customer_po or customer_po == '-':
+        customer_po = 'NONE'
+    
     customer_clean = re.sub(r'[^\w\s-]', '', customer_name).strip().upper()
-    if not customer_clean:
-        customer_clean = 'UNKNOWN'
     customer_slug = customer_clean.replace(' ', '-').replace('--', '-')
     
     po_clean = customer_po.upper()
-    if not po_clean or po_clean == '-':
-        po_clean = 'NONE'
+    order_clean = production_order_code.strip().upper()
+    demand_clean = production_demand_code.strip().upper()
     
-    # If product_details is None, use empty dict
     if product_details is None:
         product_details = {}
     
-    # Extract PressurBal, PL1, and packing_sequence
+    # Extract values including packing_sequence
     pressur_bal, pl1, packing_sequence = extract_pressur_bal_and_pl1(product_details, kit_elements)
     
-    # Clean pressur_bal
+    # Clean values for folder names
     pressur_bal_clean = re.sub(r'\D', '', str(pressur_bal)) or '1'
     
-    # Get subcode03 for folder naming
-    subcode03 = product_details.get('Subcode03', '').strip()
-    if not subcode03:
-        subcode03 = pressur_bal_clean
-    
-    # Use packing_sequence for box folder
+    # Use packing_sequence for box folder (this is the key change!)
     if packing_sequence and packing_sequence != 'N/A':
+        # Clean packing sequence for folder name (remove special chars)
         box_folder_value = re.sub(r'[^\w\-]', '', packing_sequence).strip()
         if not box_folder_value:
             box_folder_value = pl1
     else:
         box_folder_value = pl1
     
-    # Clean pallet and box numbers
     pallet_clean = str(pallet_number).strip().upper()
     box_clean = str(box_number).strip().upper()
     
-    # Build demand folder
+    element_desc = element.get('ELEMENTDESC', 'no_description').strip()
+    element_clean = re.sub(r'[^\w\s-]', '', element_desc).strip().upper()
+    element_slug = element_clean.replace(' ', '_').replace('__', '_')
+    
+    subcode03 = product_details.get('Subcode03', '').strip()
     demand_folder = f"{demand_clean}_{subcode03}"
     
-    # Build the full folder structure
+    # Build folder structure with PACKINGSEQUENCE value
     folder_structure = f"{customer_slug}--{po_clean}/{order_clean}/{demand_folder}/PALLET_{pallet_clean}_{subcode03}/BOX_{box_clean}_{box_folder_value}"
     
     print(f"[FOLDER] Generated folder: {folder_structure}")
-    return folder_structure, None
+    return folder_structure, element_slug
 
-
-# ---------------------- UPDATED: BUILD COMMON FOLDER PATH ----------------------
+# ---------------------- BUILD COMMON FOLDER PATH ----------------------
 def build_common_folder_path(customer_data, product_details, production_order_code, production_demand_code, pallet_number, box_number, kit_elements=None):
-    """Generate common folder path structure using proper data"""
+    """Generate common folder path structure using PACKINGSEQUENCE"""
     import re
     
-    # Get customer data with order and demand
-    customer_info = get_customer_data_with_order_demand(production_order_code, production_demand_code)
+    if customer_data is None:
+        customer_data = {}
     
-    customer_name = customer_info.get('CustomerName', 'UNKNOWN').strip()
-    customer_po = customer_info.get('CustomerPO', 'NONE').strip()
-    order_clean = production_order_code.strip().upper()
-    demand_clean = production_demand_code.strip().upper()
+    customer_name = customer_data.get('CustomerName', '').strip() if customer_data.get('CustomerName') else 'UNKNOWN'
+    customer_po = customer_data.get('CustomerPO', '').strip() if customer_data.get('CustomerPO') else 'NONE'
     
-    # Clean customer name and PO
+    if not customer_po or customer_po == '-':
+        customer_po = 'NONE'
+    
     customer_clean = re.sub(r'[^\w\s-]', '', customer_name).strip().upper()
-    if not customer_clean:
-        customer_clean = 'UNKNOWN'
     customer_slug = customer_clean.replace(' ', '-').replace('--', '-')
     
     po_clean = customer_po.upper()
-    if not po_clean or po_clean == '-':
-        po_clean = 'NONE'
+    order_clean = production_order_code.strip().upper()
+    demand_clean = production_demand_code.strip().upper()
     
     if product_details is None:
         product_details = {}
     
     pressur_bal, pl1, packing_sequence = extract_pressur_bal_and_pl1(product_details, kit_elements)
-    
-    # Clean pressur_bal
     pressur_bal_clean = re.sub(r'\D', '', str(pressur_bal)) or '1'
-    
-    # Get subcode03
-    subcode03 = product_details.get('Subcode03', '').strip()
-    if not subcode03:
-        subcode03 = pressur_bal_clean
     
     # Use packing_sequence for box folder
     if packing_sequence and packing_sequence != 'N/A':
@@ -151,45 +524,115 @@ def build_common_folder_path(customer_data, product_details, production_order_co
     else:
         box_folder_value = pl1
     
-    # Clean pallet and box numbers
+    subcode03 = product_details.get('Subcode03', '').strip()
+    demand_folder = f"{demand_clean}_{subcode03}"
     pallet_clean = str(pallet_number).strip().upper()
     box_clean = str(box_number).strip().upper()
     
-    # Build demand folder
-    demand_folder = f"{demand_clean}_{subcode03}"
-    
-    # Build folder path
     folder_path = f"{customer_slug}--{po_clean}/{order_clean}/{demand_folder}/PALLET_{pallet_clean}_{subcode03}/BOX_{box_clean}_{box_folder_value}"
     
     return folder_path
 
+# ---------------------- CHECK IMAGE EXISTS ----------------------
+def check_image_exists(folder_structure, element_slug, element_desc):
+    directory_path = os.path.join(settings.MEDIA_ROOT, folder_structure)
+    
+    if not os.path.exists(directory_path):
+        return None
+    
+    try:
+        files = os.listdir(directory_path)
+        
+        for file in files:
+            file_name = os.path.splitext(file)[0]
+            if file_name == element_desc:
+                return f"{settings.MEDIA_URL}{folder_structure}/{file}".replace('\\', '/')
+        
+        return None
+            
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
 
-# ---------------------- UPDATED: FETCH DATA VIEW ----------------------
-def fetch_data(request):
+# ---------------------- CHECK HUMAN IMAGE EXISTS ----------------------
+def check_human_image_exists(human_folder_structure, element_desc):
+    """Check if human image exists - checks network path only (no human_faces folder needed)"""
+    
+    # Check network path directly
+    try:
+        network_base = r"\\192.168.4.32\Corekit"
+        # Remove 'human_faces/' prefix if present
+        clean_folder = human_folder_structure.replace('human_faces/', '')
+        network_directory = os.path.join(network_base, clean_folder)
+        
+        if os.path.exists(network_directory):
+            files = os.listdir(network_directory)
+            for file in files:
+                file_name = os.path.splitext(file)[0]
+                # Check both with and without 'fc_' prefix
+                if file_name == element_desc or file_name == f"fc_{element_desc}":
+                    # Return the network path URL
+                    found_url = f"{settings.MEDIA_URL}{clean_folder}/{file}".replace('\\', '/')
+                    print(f"[HUMAN IMAGE FOUND IN NETWORK] {found_url}")
+                    return found_url
+    except Exception as e:
+        print(f"Error checking network human image: {e}")
+    
+    print(f"[HUMAN IMAGE NOT FOUND] {element_desc}")
+    return None
+
+
+
+
+# ---------------------- CHECK TXT FILE EXISTS IN DESTINATION ----------------------
+def check_txt_file_exists_in_destination(element_desc, folder_structure):
+    """
+    Check if txt file exists in destination folder
+    """
+    dest_base = Path(DESTINATION_BASE)
+    
+    # Primary path
+    primary_path = dest_base / folder_structure / f"{element_desc}.txt"
+    
+    # Check if file exists
+    if primary_path.exists():
+        print(f"[TXT FOUND] Primary path: {primary_path}")
+        return True, str(primary_path)
+    
+    # Try recursive search as fallback
+    try:
+        for file_path in dest_base.rglob(f"{element_desc}.txt"):
+            print(f"[TXT FOUND] Found at: {file_path}")
+            return True, str(file_path)
+    except Exception as e:
+        print(f"[ERROR] Recursive search failed: {e}")
+    
+    print(f"[TXT NOT FOUND] For element: {element_desc}")
+    return False, None
+
+
+
+
+# ---------------------- VIEW DATA ----------------------
+def view_data(request):
     if request.method == 'POST':
         production_order_code = request.POST.get('production_order_code', '').strip()
         production_demand_code = request.POST.get('production_demand_code', '').strip()
         pallet_number = request.POST.get('pallet_number', '1').strip()
         box_number = request.POST.get('box_number', '1').strip()
 
-        # Fetch all data
         customer_data = fetch_customer_data(production_order_code, production_demand_code)
         product_details = fetch_product_details(production_order_code, production_demand_code)
         kit_elements = fetch_kit_elements(production_order_code, production_demand_code, pallet_number, box_number)
         
-        # Get customer info with order/demand
-        customer_info = get_customer_data_with_order_demand(production_order_code, production_demand_code)
-        
-        # Extract PressurBal, PL1 and packing_sequence
+        # Extract PressurBal, PL1 and packing_sequence with kit_elements
         pressur_bal, pl1, packing_sequence = extract_pressur_bal_and_pl1(product_details, kit_elements)
-        print(f"Extracted PressurBal: {pressur_bal}, PL1: {pl1}, PackingSeq: {packing_sequence}")
         
         if product_details:
             product_details['PressurBal'] = pressur_bal
             product_details['PL1'] = pl1
             product_details['PackingSequence'] = packing_sequence
 
-        # Process each element for element images
         for element in kit_elements:
             folder_structure, element_slug = build_image_url(
                 element, 
@@ -202,11 +645,25 @@ def fetch_data(request):
                 kit_elements
             )
             
-            # Store folder structure in element for later use
             element['folder_structure'] = folder_structure
             
             element_desc = element.get('ELEMENTDESC', '').strip()
-            image_url = check_image_exists(folder_structure, element_desc, element_desc)
+            
+            # ========== CHECK IF TXT FILE EXISTS IN DESTINATION ==========
+            # Check if .txt file exists in DESTINATION_BASE with folder structure
+            dest_base = Path(DESTINATION_BASE)
+            dest_folder = dest_base / folder_structure
+            txt_file_path = dest_folder / f"{element_desc}.txt"
+            element['txt_file_exists'] = txt_file_path.exists()
+            
+            # DEBUG: Print to console
+            print(f"========== TXT FILE CHECK (DESTINATION) ==========")
+            print(f"Element: {element_desc}")
+            print(f"Destination path: {txt_file_path}")
+            print(f"Exists: {element['txt_file_exists']}")
+            print(f"===================================================")
+            
+            image_url = check_image_exists(folder_structure, element_slug, element_desc)
             if image_url:
                 element['image_url'] = image_url
                 element['has_image'] = True
@@ -219,11 +676,9 @@ def fetch_data(request):
             current_ply = element.get('ELEMENTDESC', '').strip()
             
             if current_ply:
-                # Use the folder_structure already stored in element
                 folder_structure = element.get('folder_structure', '')
                 
                 if not folder_structure:
-                    # Fallback: rebuild folder structure
                     folder_structure, _ = build_image_url(
                         element, 
                         customer_data if customer_data else {}, 
@@ -235,10 +690,8 @@ def fetch_data(request):
                         kit_elements
                     )
                 
-                # Use folder_structure directly without human_faces prefix
                 human_image_url = check_human_image_exists(folder_structure, current_ply)
                 
-                # Store human image info in element
                 element['human_image_url'] = human_image_url
                 element['has_human_image'] = human_image_url is not None
                 element['human_folder'] = folder_structure
@@ -246,15 +699,1114 @@ def fetch_data(request):
                 element['human_image_url'] = None
                 element['has_human_image'] = False
 
-        # Use customer_info for display
-        display_customer = {
-            'CustomerName': customer_info.get('CustomerName', 'Not Available'),
-            'CustomerPO': customer_info.get('CustomerPO', 'Not Available'),
-            'CustomerCode': customer_data.get('CustomerCode', 'Not Available') if customer_data else 'Not Available'
+        context = {
+            'customer_data': customer_data if customer_data else {
+                'CustomerName': 'Not Available',
+                'CustomerPO': 'Not Available',
+                'CustomerCode': 'Not Available'
+            },
+            'product_details': product_details if product_details else {
+                'ItemType': 'Not Available',
+                'Subcode01': 'N/A',
+                'Subcode02': 'N/A',
+                'Subcode03': 'N/A',
+                'Subcode04': 'N/A',
+                'Subcode05': 'N/A',
+                'PressurBal': '',
+                'PL1': '1',
+                'PackingSequence': ''
+            },
+            'kit_elements': kit_elements or [],
+            'production_order_code': production_order_code,
+            'production_demand_code': production_demand_code,
+            'pallet_number': pallet_number,
+            'box_number': box_number,
+            'packing_sequence': packing_sequence,
+            'MEDIA_URL': settings.MEDIA_URL,
+            'DESTINATION_BASE': DESTINATION_BASE,  # Pass to template for debug
         }
+
+        return render(request, 'view_data.html', context)
+
+    # GET request handling
+    production_order_code = request.GET.get('production_order_code', '').strip()
+    production_demand_code = request.GET.get('production_demand_code', '').strip()
+    pallet_number = request.GET.get('pallet_number', '1').strip()
+    box_number = request.GET.get('box_number', '1').strip()
+
+    if production_order_code and production_demand_code:
+        customer_data = fetch_customer_data(production_order_code, production_demand_code)
+        product_details = fetch_product_details(production_order_code, production_demand_code)
+        kit_elements = fetch_kit_elements(production_order_code, production_demand_code, pallet_number, box_number)
+        
+        pressur_bal, pl1, packing_sequence = extract_pressur_bal_and_pl1(product_details, kit_elements)
+        
+        if product_details:
+            product_details['PressurBal'] = pressur_bal
+            product_details['PL1'] = pl1
+            product_details['PackingSequence'] = packing_sequence
+
+        for element in kit_elements:
+            folder_structure, element_slug = build_image_url(
+                element, 
+                customer_data if customer_data else {}, 
+                product_details if product_details else {}, 
+                production_order_code, 
+                production_demand_code, 
+                pallet_number, 
+                box_number,
+                kit_elements
+            )
+            
+            element['folder_structure'] = folder_structure
+            
+            element_desc = element.get('ELEMENTDESC', '').strip()
+            
+            # ========== CHECK IF TXT FILE EXISTS IN DESTINATION ==========
+            # Check if .txt file exists in DESTINATION_BASE with folder structure
+            dest_base = Path(DESTINATION_BASE)
+            dest_folder = dest_base / folder_structure
+            txt_file_path = dest_folder / f"{element_desc}.txt"
+            element['txt_file_exists'] = txt_file_path.exists()
+            
+            # DEBUG: Print to console
+            print(f"========== TXT FILE CHECK (DESTINATION) ==========")
+            print(f"Element: {element_desc}")
+            print(f"Destination path: {txt_file_path}")
+            print(f"Exists: {element['txt_file_exists']}")
+            print(f"===================================================")
+            
+            image_url = check_image_exists(folder_structure, element_slug, element_desc)
+            if image_url:
+                element['image_url'] = image_url
+                element['has_image'] = True
+            else:
+                element['image_url'] = None
+                element['has_image'] = False
+        
+        for element in kit_elements:
+            current_ply = element.get('ELEMENTDESC', '').strip()
+            
+            if current_ply:
+                folder_structure = element.get('folder_structure', '')
+                
+                if not folder_structure:
+                    folder_structure, _ = build_image_url(
+                        element, 
+                        customer_data if customer_data else {}, 
+                        product_details if product_details else {}, 
+                        production_order_code, 
+                        production_demand_code, 
+                        pallet_number, 
+                        box_number,
+                        kit_elements
+                    )
+                
+                human_image_url = check_human_image_exists(folder_structure, current_ply)
+                
+                element['human_image_url'] = human_image_url
+                element['has_human_image'] = human_image_url is not None
+                element['human_folder'] = folder_structure
+            else:
+                element['human_image_url'] = None
+                element['has_human_image'] = False
         
         context = {
-            'customer_data': display_customer,
+            'customer_data': customer_data if customer_data else {
+                'CustomerName': 'Not Available',
+                'CustomerPO': 'Not Available',
+                'CustomerCode': 'Not Available'
+            },
+            'product_details': product_details if product_details else {
+                'ItemType': 'Not Available',
+                'Subcode01': 'N/A',
+                'Subcode02': 'N/A',
+                'Subcode03': 'N/A',
+                'Subcode04': 'N/A',
+                'Subcode05': 'N/A',
+                'PressurBal': '',
+                'PL1': '1',
+                'PackingSequence': ''
+            },
+            'kit_elements': kit_elements or [],
+            'production_order_code': production_order_code,
+            'production_demand_code': production_demand_code,
+            'pallet_number': pallet_number,
+            'box_number': box_number,
+            'packing_sequence': packing_sequence,
+            'MEDIA_URL': settings.MEDIA_URL,
+            'DESTINATION_BASE': DESTINATION_BASE,  # Pass to template for debug
+        }
+
+        return render(request, 'view_data.html', context)
+
+    return render(request, 'fetch_data.html')
+
+
+def write_timing_log(log_data):
+    """
+    Write timing information to a text file
+    """
+    # Create logs directory in project root
+    logs_dir = os.path.join(settings.BASE_DIR, 'logs')
+    
+    # Ensure directory exists
+    if not os.path.exists(logs_dir):
+        os.makedirs(logs_dir)
+        print(f"[LOG] Created logs directory at: {logs_dir}")
+    
+    # Create filename with current date
+    today = datetime.now().strftime('%Y-%m-%d')
+    log_filename = f"capture_times_{today}.txt"
+    log_filepath = os.path.join(logs_dir, log_filename)
+    
+    # Get current timestamp
+    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    # Calculate durations if timestamps are provided
+    
+    back_duration = log_data.get('back_capture_duration', 'N/A')
+    front_duration = log_data.get('front_capture_duration', 'N/A')
+    total_duration = log_data.get('total_duration', 'N/A')
+    between_duration = log_data.get('between_captures_duration', 'N/A')
+    upload_duration = log_data.get('upload_duration', 'N/A')
+    
+    # Format the log entry
+    log_entry = f"""
+{'='*80}
+TIMESTAMP: {current_time}
+{'='*80}
+
+ELEMENT INFORMATION:
+-------------------
+Element Description: {log_data.get('element_desc', 'N/A')}
+Image Type: {log_data.get('image_type', 'N/A')}
+Status: {log_data.get('status', 'N/A')}
+
+ORDER INFORMATION:
+-----------------
+Order Code: {log_data.get('order_code', 'N/A')}
+Demand Code: {log_data.get('demand_code', 'N/A')}
+
+CUSTOMER INFORMATION:
+--------------------
+Customer Name: {log_data.get('customer_name', 'N/A')}
+Customer PO: {log_data.get('customer_po', 'N/A')}
+
+CONTAINER INFORMATION:
+---------------------
+Pallet Number: {log_data.get('pallet_number', 'N/A')}
+Box Number: {log_data.get('box_number', 'N/A')}
+
+TIMING INFORMATION:
+------------------
+Capture Start Time: {log_data.get('capture_start_time', 'N/A')}
+Back Camera Capture: {log_data.get('back_capture_time', 'N/A')}
+Front Camera Capture: {log_data.get('front_capture_time', 'N/A')}
+Upload Start Time: {log_data.get('upload_start_time', 'N/A')}
+Upload Complete Time: {log_data.get('upload_complete_time', 'N/A')}
+
+DURATIONS (seconds):
+-------------------
+Total Duration (Start to Upload): {total_duration}
+Time to Back Camera Capture: {back_duration}
+Time to Front Camera Capture: {front_duration}
+Time Between Captures: {between_duration}
+Upload Processing Time: {upload_duration}
+
+SYSTEM INFORMATION:
+------------------
+Folder Path: {log_data.get('folder_path', 'N/A')}
+IP Address: {log_data.get('ip_address', 'N/A')}
+User Agent: {log_data.get('user_agent', 'N/A')[:100]}
+
+{'='*80}
+
+"""
+    
+    # Write to file
+    try:
+        with open(log_filepath, 'a', encoding='utf-8') as f:
+            f.write(log_entry)
+        print(f"[LOG] Successfully wrote to: {log_filepath}")
+        return True
+    except Exception as e:
+        print(f"[LOG ERROR] Failed to write: {e}")
+        return False
+
+# ---------------------- SIMPLE LOG FUNCTION (DIRECT CALL) ----------------------
+def log_capture_time_simple(element_desc, order_code, demand_code, pallet_number, 
+                            box_number, capture_start, upload_complete, 
+                            status="success", extra_data=None):
+    """
+    Simple function to log capture time directly
+    """
+    logs_dir = os.path.join(settings.BASE_DIR, 'logs')
+    if not os.path.exists(logs_dir):
+        os.makedirs(logs_dir)
+    
+    today = datetime.now().strftime('%Y-%m-%d')
+    log_filepath = os.path.join(logs_dir, f"capture_times_{today}.txt")
+    
+    # Calculate duration
+    duration = "N/A"
+    if capture_start and upload_complete:
+        try:
+            start = datetime.fromisoformat(capture_start.replace('Z', '+00:00'))
+            end = datetime.fromisoformat(upload_complete.replace('Z', '+00:00'))
+            duration = f"{(end - start).total_seconds():.3f}"
+        except:
+            pass
+    
+    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    log_entry = f"""
+[{current_time}] CAPTURE LOG
+Element: {element_desc}
+Order: {order_code} | Demand: {demand_code}
+Pallet: {pallet_number} | Box: {box_number}
+Capture Start: {capture_start}
+Upload Complete: {upload_complete}
+Total Duration: {duration} seconds
+Status: {status}
+{'='*60}
+"""
+    
+    if extra_data:
+        log_entry += f"Extra: {extra_data}\n{'='*60}\n"
+    
+    try:
+        with open(log_filepath, 'a', encoding='utf-8') as f:
+            f.write(log_entry)
+        print(f"[SIMPLE LOG] Saved: {log_filepath}")
+        return True
+    except Exception as e:
+        print(f"[SIMPLE LOG ERROR] {e}")
+        return False
+
+def log_to_network_file(log_data):
+    """
+    Save timing logs directly to network path: \\192.168.4.32\Corekit\logs\
+    Creates folder automatically if it doesn't exist
+    """
+    # Network log path
+    network_base = r"\\192.168.4.32\Corekit"
+    logs_dir = os.path.join(network_base, "logs")
+    
+    # Create logs directory if it doesn't exist
+    try:
+        if not os.path.exists(logs_dir):
+            os.makedirs(logs_dir, exist_ok=True)
+            print(f"[LOG] Created logs directory: {logs_dir}")
+    except Exception as e:
+        print(f"[LOG ERROR] Could not create logs directory: {e}")
+        # Fallback to local logs if network fails
+        logs_dir = os.path.join(settings.BASE_DIR, 'logs')
+        os.makedirs(logs_dir, exist_ok=True)
+    
+    # Create filename with date
+    today = datetime.now().strftime('%Y-%m-%d')
+    log_filename = f"capture_upload_times_{today}.txt"
+    log_filepath = os.path.join(logs_dir, log_filename)
+    
+    # Current timestamp
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    # Format the log entry
+    log_entry = f"""
+{'='*80}
+[{timestamp}] IMAGE CAPTURE & UPLOAD LOG
+{'='*80}
+
+ELEMENT INFORMATION:
+-------------------
+Element Description: {log_data.get('element_desc', 'N/A')}
+Image Type: {log_data.get('image_type', 'N/A')}
+Status: {log_data.get('status', 'N/A')}
+
+ORDER INFORMATION:
+-----------------
+Order Code: {log_data.get('order_code', 'N/A')}
+Demand Code: {log_data.get('demand_code', 'N/A')}
+
+CUSTOMER INFORMATION:
+--------------------
+Customer Name: {log_data.get('customer_name', 'N/A')}
+Customer PO: {log_data.get('customer_po', 'N/A')}
+
+CONTAINER INFORMATION:
+---------------------
+Pallet Number: {log_data.get('pallet_number', 'N/A')}
+Box Number: {log_data.get('box_number', 'N/A')}
+
+TIME INFORMATION:
+----------------
+Capture Start Time: {log_data.get('capture_start_time', 'N/A')}
+Back Camera Capture: {log_data.get('back_capture_time', 'N/A')}
+Front Camera Capture: {log_data.get('front_capture_time', 'N/A')}
+Upload Start Time: {log_data.get('upload_start_time', 'N/A')}
+Upload Complete Time: {log_data.get('upload_complete_time', 'N/A')}
+
+DURATIONS (seconds):
+-------------------
+Total Duration (Start to Upload): {log_data.get('total_duration', 'N/A')}
+Time to Back Camera Capture: {log_data.get('back_capture_duration', 'N/A')}
+Time to Front Camera Capture: {log_data.get('front_capture_duration', 'N/A')}
+Time Between Captures: {log_data.get('between_captures_duration', 'N/A')}
+Upload Processing Time: {log_data.get('upload_duration', 'N/A')}
+
+SYSTEM INFORMATION:
+------------------
+Folder Path: {log_data.get('folder_path', 'N/A')}
+IP Address: {log_data.get('ip_address', 'N/A')}
+
+{'='*80}
+
+"""
+    
+    # Write to network log file
+    try:
+        with open(log_filepath, 'a', encoding='utf-8') as log_file:
+            log_file.write(log_entry)
+        print(f"[LOG] Successfully saved to: {log_filepath}")
+        return True
+    except Exception as e:
+        print(f"[LOG ERROR] Failed to write: {e}")
+        return False
+
+def log_simple_message(message, log_type="info"):
+    """Simple function to log quick messages to network"""
+    network_base = r"\\192.168.4.32\Corekit"
+    logs_dir = os.path.join(network_base, "logs")
+    
+    try:
+        if not os.path.exists(logs_dir):
+            os.makedirs(logs_dir, exist_ok=True)
+    except:
+        # Fallback to local
+        logs_dir = os.path.join(settings.BASE_DIR, 'logs')
+        os.makedirs(logs_dir, exist_ok=True)
+    
+    today = datetime.now().strftime('%Y-%m-%d')
+    log_filepath = os.path.join(logs_dir, f"simple_log_{today}.txt")
+    
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    
+    try:
+        with open(log_filepath, 'a', encoding='utf-8') as f:
+            f.write(f"[{timestamp}] [{log_type.upper()}] {message}\n")
+        return True
+    except Exception as e:
+        print(f"Simple log error: {e}")
+        return False
+
+# ---------------------- UPLOAD ELEMENT IMAGE ----------------------
+@csrf_exempt
+def upload_element_image(request):
+    if request.method == 'POST':
+        # Log start of upload
+        log_simple_message("upload_element_image called", "debug")
+        
+        try:
+            # Get timing information
+            capture_start_time = request.POST.get('capture_start_time')
+            back_capture_time = request.POST.get('back_capture_time')
+            front_capture_time = request.POST.get('front_capture_time')
+            upload_start_time = request.POST.get('upload_start_time')
+            
+            element_desc = request.POST.get('element_desc', '').strip()
+            is_human_image = request.POST.get('is_human_image') == 'true'
+            
+            # Get order information
+            production_order_code = request.POST.get('production_order_code', '').strip()
+            production_demand_code = request.POST.get('production_demand_code', '').strip()
+            pallet_number = request.POST.get('pallet_number', '').strip()
+            box_number = request.POST.get('box_number', '').strip()
+            
+            # Log basic info
+            log_simple_message(f"Processing: {element_desc} (Human: {is_human_image})", "info")
+            log_simple_message(f"Order: {production_order_code}, Demand: {production_demand_code}", "info")
+            log_simple_message(f"Capture start time: {capture_start_time}", "timing")
+            
+            # Set filename
+            if is_human_image:
+                filename = f"fc_{element_desc}.jpeg"
+            else:
+                filename = f"{element_desc}.jpeg"
+
+            image_data = request.POST.get('element_image')
+            
+            if not image_data:
+                log_simple_message("No image data received", "error")
+                return JsonResponse({'status': 'error', 'message': 'No image data'}, status=400)
+
+            # Dummy class for build_image_url
+            class Dummy:
+                def __init__(self, desc):
+                    self.desc = desc
+                def get(self, key, default):
+                    return self.desc if key == 'ELEMENTDESC' else default
+
+            dummy = Dummy(element_desc)
+
+            # Fetch data
+            from .utils.db_queries import fetch_customer_data, fetch_product_details, fetch_kit_elements
+            customer_data = fetch_customer_data(production_order_code, production_demand_code)
+            product_details = fetch_product_details(production_order_code, production_demand_code)
+            kit_elements = fetch_kit_elements(production_order_code, production_demand_code, pallet_number, box_number)
+
+            # Build folder structure
+            folder_structure, _ = build_image_url(
+                dummy,
+                customer_data or {},
+                product_details or {},
+                production_order_code,
+                production_demand_code,
+                pallet_number,
+                box_number,
+                kit_elements
+            )
+            
+            log_simple_message(f"Folder structure: {folder_structure}", "path")
+
+            image_bytes = base64.b64decode(image_data)
+
+            # Save the image
+            if is_human_image:
+                # Save only to network (no human_faces folder needed)
+                network_base = r"\\192.168.4.32\Corekit"
+                folder_structure_clean = folder_structure.strip('/\\')
+                network_folder = os.path.join(network_base, folder_structure_clean)
+                filepath = os.path.join(network_folder, filename)
+                os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                
+                with open(filepath, 'wb') as f:
+                    f.write(image_bytes)
+                
+                log_simple_message(f"Human image saved to network: {filepath}", "success")
+            else:
+                # Save element image to local media
+                main_path = os.path.join(settings.MEDIA_ROOT, folder_structure)
+                os.makedirs(main_path, exist_ok=True)
+                filepath = os.path.join(main_path, filename)
+                
+                with open(filepath, 'wb') as f:
+                    f.write(image_bytes)
+                
+                log_simple_message(f"Element image saved to: {filepath}", "success")
+            
+            # LOG THE TIMING INFORMATION TO NETWORK
+            upload_complete_time = datetime.now().isoformat()
+            
+            # Get customer name and PO
+            customer_name = customer_data.get('CustomerName', 'UNKNOWN') if customer_data else 'UNKNOWN'
+            customer_po = customer_data.get('CustomerPO', 'NONE') if customer_data else 'NONE'
+            
+            # Extract PL value
+            pl_match = re.search(r'BOX_\d+_(\d+)', folder_structure)
+            pl_value = pl_match.group(1) if pl_match else '1'
+            
+            # Calculate durations
+            total_duration = "N/A"
+            back_capture_duration = "N/A"
+            front_capture_duration = "N/A"
+            between_captures_duration = "N/A"
+            upload_duration = "N/A"
+            
+            if capture_start_time and upload_complete_time:
+                try:
+                    start = datetime.fromisoformat(capture_start_time.replace('Z', '+00:00'))
+                    end = datetime.fromisoformat(upload_complete_time.replace('Z', '+00:00'))
+                    total_duration = f"{(end - start).total_seconds():.3f}"
+                    log_simple_message(f"Total duration for {element_desc}: {total_duration} seconds", "duration")
+                except Exception as e:
+                    log_simple_message(f"Could not calculate total duration: {e}", "warning")
+            
+            if capture_start_time and back_capture_time:
+                try:
+                    start = datetime.fromisoformat(capture_start_time.replace('Z', '+00:00'))
+                    back = datetime.fromisoformat(back_capture_time.replace('Z', '+00:00'))
+                    back_capture_duration = f"{(back - start).total_seconds():.3f}"
+                except:
+                    pass
+            
+            if capture_start_time and front_capture_time:
+                try:
+                    start = datetime.fromisoformat(capture_start_time.replace('Z', '+00:00'))
+                    front = datetime.fromisoformat(front_capture_time.replace('Z', '+00:00'))
+                    front_capture_duration = f"{(front - start).total_seconds():.3f}"
+                except:
+                    pass
+            
+            if back_capture_time and front_capture_time:
+                try:
+                    back = datetime.fromisoformat(back_capture_time.replace('Z', '+00:00'))
+                    front = datetime.fromisoformat(front_capture_time.replace('Z', '+00:00'))
+                    between_captures_duration = f"{abs((front - back).total_seconds()):.3f}"
+                except:
+                    pass
+            
+            if upload_start_time and upload_complete_time:
+                try:
+                    up_start = datetime.fromisoformat(upload_start_time.replace('Z', '+00:00'))
+                    up_end = datetime.fromisoformat(upload_complete_time.replace('Z', '+00:00'))
+                    upload_duration = f"{(up_end - up_start).total_seconds():.3f}"
+                except:
+                    pass
+            
+            # Prepare log data for network storage
+            log_data = {
+                'element_desc': element_desc,
+                'image_type': 'Human Image' if is_human_image else 'Element Image',
+                'status': 'success',
+                'order_code': production_order_code,
+                'demand_code': production_demand_code,
+                'customer_name': customer_name,
+                'customer_po': customer_po,
+                'pallet_number': pallet_number,
+                'box_number': box_number,
+                'pl_value': pl_value,
+                'capture_start_time': capture_start_time,
+                'back_capture_time': back_capture_time,
+                'front_capture_time': front_capture_time,
+                'upload_start_time': upload_start_time,
+                'upload_complete_time': upload_complete_time,
+                'total_duration': total_duration,
+                'back_capture_duration': back_capture_duration,
+                'front_capture_duration': front_capture_duration,
+                'between_captures_duration': between_captures_duration,
+                'upload_duration': upload_duration,
+                'folder_path': folder_structure,
+                'ip_address': request.META.get('REMOTE_ADDR', 'N/A')
+            }
+            
+            # Save to network log file
+            log_to_network_file(log_data)
+            
+            return JsonResponse({
+                'status': 'success',
+                'filename': filename,
+                'path': str(filepath),
+                'message': 'Image saved successfully',
+                'total_duration': total_duration,
+                'log_saved_to': r'\\192.168.4.32\Corekit\logs'
+            })
+
+        except Exception as e:
+            error_msg = f"Upload error: {str(e)}"
+            log_simple_message(error_msg, "error")
+            import traceback
+            traceback.print_exc()
+            
+            return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+    return JsonResponse({'status': 'error', 'message': 'Invalid request method'}, status=405)
+
+# ---------------------- DELETE IMAGE ----------------------
+@csrf_exempt
+def delete_element_image(request):
+    if request.method == 'POST':
+        try:
+            image_url = request.POST.get('image_url', '').strip()
+            is_human_image = request.POST.get('is_human_image') == 'true'
+            element_desc = request.POST.get('element_desc', '').strip()
+            production_order_code = request.POST.get('production_order_code', '').strip()
+            production_demand_code = request.POST.get('production_demand_code', '').strip()
+            pallet_number = request.POST.get('pallet_number', '').strip()
+            box_number = request.POST.get('box_number', '').strip()
+            
+            if not element_desc:
+                return JsonResponse({'status': 'error', 'message': 'Element description is required'}, status=400)
+            
+            class Dummy:
+                def __init__(self, desc):
+                    self.desc = desc
+                def get(self, key, default):
+                    return self.desc if key == 'ELEMENTDESC' else default
+            
+            dummy = Dummy(element_desc)
+            
+            customer_data = fetch_customer_data(production_order_code, production_demand_code)
+            product_details = fetch_product_details(production_order_code, production_demand_code)
+            kit_elements = fetch_kit_elements(production_order_code, production_demand_code, pallet_number, box_number)
+            
+            folder_structure, _ = build_image_url(
+                dummy,
+                customer_data or {},
+                product_details or {},
+                production_order_code,
+                production_demand_code,
+                pallet_number,
+                box_number,
+                kit_elements
+            )
+            
+            deleted_files = []
+            failed_files = []
+            
+            # Delete element image (local only)
+            element_filename = f"{element_desc}.jpeg"
+            main_folder = os.path.join(settings.MEDIA_ROOT, folder_structure)
+            element_file_path = os.path.join(main_folder, element_filename)
+            
+            if os.path.exists(element_file_path):
+                try:
+                    os.remove(element_file_path)
+                    deleted_files.append(f"Element image: {element_filename}")
+                except Exception as e:
+                    failed_files.append(f"Element image: {str(e)}")
+            
+            # Delete human image from network only
+            human_filename = f"fc_{element_desc}.jpeg"
+            try:
+                network_base = r"\\192.168.4.32\Corekit"
+                folder_structure_clean = folder_structure.strip('/\\')
+                network_folder = os.path.join(network_base, folder_structure_clean)
+                network_file_path = os.path.join(network_folder, human_filename)
+                
+                if os.path.exists(network_file_path):
+                    os.remove(network_file_path)
+                    deleted_files.append(f"Human image (network): {human_filename}")
+            except Exception as e:
+                print(f"Error deleting network human image: {e}")
+                failed_files.append(f"Human image (network): {str(e)}")
+            
+            # Log deletion time
+            deletion_time = datetime.now()
+            logs_dir = os.path.join(settings.BASE_DIR, 'logs')
+            os.makedirs(logs_dir, exist_ok=True)
+            today = datetime.now().strftime('%Y-%m-%d')
+            log_filename = f"image_deletions_{today}.txt"
+            log_filepath = os.path.join(logs_dir, log_filename)
+            
+            with open(log_filepath, 'a', encoding='utf-8') as log_file:
+                log_file.write(f"""
+{'='*80}
+[{deletion_time.strftime('%Y-%m-%d %H:%M:%S')}] IMAGE DELETION
+{'='*80}
+Element: {element_desc}
+Order: {production_order_code}
+Demand: {production_demand_code}
+Pallet: {pallet_number}
+Box: {box_number}
+Deleted Files: {', '.join(deleted_files)}
+Failed: {', '.join(failed_files)}
+{'='*80}
+
+""")
+            
+            if deleted_files:
+                message = f"Successfully deleted: {', '.join(deleted_files)}"
+                if failed_files:
+                    message += f" | Failed: {', '.join(failed_files)}"
+                return JsonResponse({
+                    'status': 'success', 
+                    'message': message,
+                    'deleted_files': deleted_files,
+                    'failed_files': failed_files
+                })
+            else:
+                return JsonResponse({
+                    'status': 'error', 
+                    'message': 'No images found to delete'
+                }, status=404)
+                
+        except Exception as e:
+            print(f"Delete image error: {e}")
+            import traceback
+            traceback.print_exc()
+            return JsonResponse({
+                'status': 'error', 
+                'message': f'Server error: {str(e)}'
+            }, status=500)
+
+    return JsonResponse({'status': 'error', 'message': 'Invalid request method'}, status=405)
+
+
+# ---------------------- GET ELEMENT DATA FROM DB (UPDATED) ----------------------
+def get_element_data_from_db(element_desc):
+    """
+    Get complete data for an element from SKP_KITUPLOAD table
+    """
+    try:
+        conn = get_db_connection()
+        if conn is None:
+            logger.error("Could not connect to database")
+            return None
+        
+        try:
+            # Query SKP_KITUPLOAD table
+            sql = """
+                SELECT 
+                    KE.COMPANYCODE,
+                    KE.PARTDESC,
+                    KE.TOTALPCS,
+                    KE.ITEMTYPECODE,
+                    KE.DECOSUBCODE01,
+                    KE.DECOSUBCODE02,
+                    KE.DECOSUBCODE03,
+                    KE.DECOSUBCODE04,
+                    KE.DECOSUBCODE05,
+                    KE.DECOSUBCODE06,
+                    KE.DECOSUBCODE07,
+                    KE.DECOSUBCODE08,
+                    KE.DECOSUBCODE09,
+                    KE.DECOSUBCODE10,
+                    KE.CODE,
+                    KE.ELEMENTDESC,
+                    KE.BOXNUMBER,
+                    KE.ELEMENTSEQ,
+                    KE.FBGFABRIC,
+                    KE.CUTTYPE,
+                    KE.PALLETNUMBER,
+                    KE.PAPERTUBE,
+                    KE.WEIGHTUNITOFMEASURECODE,
+                    KE.NETWEIGHT,
+                    KE.GROSSWEIGHT,
+                    KE.CREATIONDATETIME,
+                    KE.CREATIONUSER,
+                    KE.ABSUNIQUEID,
+                    KE.BOXSEQUENCE,
+                    KE.PACKINGSEQUENCE,
+                    KE.PLACEMENTINBOX,
+                    KE.LENGHT1,
+                    KE.TOLLENGHT1,
+                    KE.LENGHT2,
+                    KE.TOLLENGHT2,
+                    KE.WIDTH1,
+                    KE.TOLWIDTH1,
+                    KE.WIDTH2,
+                    KE.TOLWIDTH2,
+                    KE.THICKNESS,
+                    KE.TOLTHICKNESS,
+                    KE.ROOTSIDEANGLEA2,
+                    KE.TOLROOTSIDEANGLEA2,
+                    KE.TIPSIDEANGLEA1,
+                    KE.TOLTIPSIDEANGLEA1,
+                    KE.TIPSIDEANGLEA2,
+                    KE.TOLTIPSIDEANGLEA2,
+                    KE.ANGLEB1,
+                    KE.TOLANGLEB1,
+                    KE.ANGLEB2,
+                    KE.TOLANGLEB2,
+                    KE.ROOTSIDEANGLEC1,
+                    KE.TOLROOTSIDEANGLEC1,
+                    KE.ROOTSIDEANGLEC2,
+                    KE.TOLROOTSIDEANGLEC2,
+                    KE.TIPSIDEANGLEC1,
+                    KE.TOLTIPSIDEANGLEC1,
+                    KE.TIPSIDEANGLEC2,
+                    KE.TOLTIPSIDEANGLEC2,
+                    KE.T1,
+                    KE.TOLT1
+                FROM SKP_KITUPLOAD KE
+                WHERE UPPER(KE.ELEMENTDESC) = UPPER(?)
+            """
+            
+            stmt = ibm_db.prepare(conn, sql)
+            ibm_db.bind_param(stmt, 1, element_desc)
+            ibm_db.execute(stmt)
+            
+            data = ibm_db.fetch_assoc(stmt)
+            
+            if not data:
+                logger.info(f"Element not found in SKP_KITUPLOAD: {element_desc}")
+                return None
+            
+            logger.info(f"Found element in SKP_KITUPLOAD: {element_desc}")
+            
+            # Return all data
+            return {
+                'COMPANYCODE': data.get('COMPANYCODE', '').strip(),
+                'PARTDESC': data.get('PARTDESC', '').strip(),
+                'TOTALPCS': str(data.get('TOTALPCS', '0')).strip(),
+                'ITEMTYPECODE': data.get('ITEMTYPECODE', '').strip(),
+                'DECOSUBCODE01': data.get('DECOSUBCODE01', '').strip(),
+                'DECOSUBCODE02': data.get('DECOSUBCODE02', '').strip(),
+                'DECOSUBCODE03': data.get('DECOSUBCODE03', '').strip(),
+                'DECOSUBCODE04': data.get('DECOSUBCODE04', '').strip(),
+                'DECOSUBCODE05': data.get('DECOSUBCODE05', '').strip(),
+                'DECOSUBCODE06': data.get('DECOSUBCODE06', '').strip(),
+                'DECOSUBCODE07': data.get('DECOSUBCODE07', '').strip(),
+                'DECOSUBCODE08': data.get('DECOSUBCODE08', '').strip(),
+                'DECOSUBCODE09': data.get('DECOSUBCODE09', '').strip(),
+                'DECOSUBCODE10': data.get('DECOSUBCODE10', '').strip(),
+                'CODE': data.get('CODE', '').strip(),
+                'ELEMENTDESC': data.get('ELEMENTDESC', '').strip(),
+                'BOXNUMBER': str(data.get('BOXNUMBER', '1')).strip() or '1',
+                'ELEMENTSEQ': str(data.get('ELEMENTSEQ', '1')).strip() or '1',
+                'FBGFABRIC': data.get('FBGFABRIC', '').strip(),
+                'CUTTYPE': data.get('CUTTYPE', '').strip(),
+                'PALLETNUMBER': str(data.get('PALLETNUMBER', '1')).strip() or '1',
+                'PAPERTUBE': data.get('PAPERTUBE', '').strip(),
+                'WEIGHTUNITOFMEASURECODE': data.get('WEIGHTUNITOFMEASURECODE', '').strip(),
+                'NETWEIGHT': str(data.get('NETWEIGHT', '0')).strip(),
+                'GROSSWEIGHT': str(data.get('GROSSWEIGHT', '0')).strip(),
+                'PACKINGSEQUENCE': data.get('PACKINGSEQUENCE', '').strip(),
+                'BOXSEQUENCE': str(data.get('BOXSEQUENCE', '1')).strip() or '1',
+                'PLACEMENTINBOX': str(data.get('PLACEMENTINBOX', '1')).strip() or '1'
+            }
+            
+        except Exception as e:
+            logger.error(f"Error querying database for {element_desc}: {str(e)}")
+            return None
+        finally:
+            if conn:
+                try:
+                    ibm_db.close(conn)
+                except:
+                    pass
+                    
+    except Exception as e:
+        logger.error(f"Error in get_element_data_from_db for {element_desc}: {str(e)}")
+        return None
+
+
+# ---------------------- BUILD FOLDER PATH FOR ELEMENT (UPDATED) ----------------------
+def build_folder_path_for_element(element_data, production_order_code=None, production_demand_code=None, 
+                                  pallet_number=None, box_number=None):
+    """
+    Build folder path for an element using element data from SKP_KITUPLOAD
+    """
+    try:
+        if not element_data:
+            return None, False, "No element data provided"
+        
+        element_desc = element_data.get('ELEMENTDESC', '').strip()
+        if not element_desc:
+            return None, False, "No element description in data"
+        
+        # ========== GET ORDER AND DEMAND CODES ==========
+        # Use UI parameters if provided, otherwise use DECOSUBCODE01 and DECOSUBCODE02
+        if production_order_code and production_demand_code:
+            order_code = production_order_code.strip().upper()
+            demand_code = production_demand_code.strip().upper()
+            logger.info(f"Using order/demand from UI: {order_code}, {demand_code}")
+        else:
+            # Use DECOSUBCODE01 as Order Code and DECOSUBCODE02 as Demand Code
+            order_code = element_data.get('DECOSUBCODE01', '').strip().upper()
+            demand_code = element_data.get('DECOSUBCODE02', '').strip().upper()
+            
+            if not order_code or not demand_code:
+                logger.error(f"❌ No order/demand found in SKP_KITUPLOAD for element: {element_desc}")
+                return None, False, f"No order/demand found for element: {element_desc}"
+            
+            logger.info(f"Using order/demand from SKP_KITUPLOAD: {order_code}, {demand_code}")
+        
+        # ========== GET CUSTOMER DATA ==========
+        customer_data = fetch_customer_data(order_code, demand_code)
+        
+        # ========== GET PALLET AND BOX NUMBERS ==========
+        if pallet_number:
+            pallet_clean = str(pallet_number).strip().upper()
+        else:
+            pallet_clean = str(element_data.get('PALLETNUMBER', '1')).strip().upper()
+        
+        if box_number:
+            box_clean = str(box_number).strip().upper()
+        else:
+            box_clean = str(element_data.get('BOXNUMBER', '1')).strip().upper()
+        
+        logger.info(f"Using pallet: {pallet_clean}, box: {box_clean}")
+        
+        # ========== GET CUSTOMER NAME AND PO ==========
+        if customer_data:
+            customer_name = customer_data.get('CustomerName', 'UNKNOWN').strip()
+            customer_po = customer_data.get('CustomerPO', 'NONE').strip()
+            logger.info(f"✅ Found customer: {customer_name}, PO: {customer_po}")
+        else:
+            customer_name = 'UNKNOWN'
+            customer_po = 'NONE'
+            logger.warning(f"⚠️ No customer data found for order: {order_code}, demand: {demand_code}")
+        
+        # Clean customer name and PO
+        customer_clean = re.sub(r'[^\w\s-]', '', customer_name).strip().upper()
+        if not customer_clean:
+            customer_clean = 'UNKNOWN'
+        customer_slug = customer_clean.replace(' ', '-').replace('--', '-')
+        
+        po_clean = customer_po.upper()
+        if not po_clean or po_clean == '-':
+            po_clean = 'NONE'
+        
+        # ========== EXTRACT PRESSURBAL AND PL1 ==========
+        pressur_bal = None
+        pl1 = None
+        packing_sequence = element_data.get('PACKINGSEQUENCE', '').strip()
+        
+        # Extract PL1 from PACKINGSEQUENCE
+        if packing_sequence and packing_sequence != 'N/A' and packing_sequence != 'None':
+            match = re.search(r'PL(\d+)', packing_sequence.upper())
+            if match:
+                pl1 = match.group(1)
+            elif 'PL' in packing_sequence.upper():
+                pl1 = '1'
+        
+        # If not found, try from DECOSUBCODE
+        if pl1 is None:
+            # Check DECOSUBCODE03 first (most common location for PL)
+            subcode03 = element_data.get('DECOSUBCODE03', '').strip()
+            if subcode03 and subcode03 != 'N/A':
+                if 'PL1' in subcode03.upper():
+                    match = re.search(r'PL1\s*(\d+)?', subcode03.upper())
+                    pl1 = match.group(1) if match and match.group(1) else '1'
+                elif 'PL' in subcode03.upper():
+                    match = re.search(r'PL\s*(\d+)', subcode03.upper())
+                    pl1 = match.group(1) if match else '1'
+        
+        # If still not found, try other DECOSUBCODE fields
+        if pl1 is None:
+            for i in range(1, 11):
+                subcode_key = f'DECOSUBCODE{str(i).zfill(2)}'
+                if subcode_key != 'DECOSUBCODE03':  # Skip already checked
+                    subcode_value = element_data.get(subcode_key, '').strip()
+                    if subcode_value and subcode_value != 'N/A':
+                        if 'PL1' in subcode_value.upper():
+                            match = re.search(r'PL1\s*(\d+)?', subcode_value.upper())
+                            pl1 = match.group(1) if match and match.group(1) else '1'
+                            break
+                        elif 'PL' in subcode_value.upper():
+                            match = re.search(r'PL\s*(\d+)', subcode_value.upper())
+                            pl1 = match.group(1) if match else '1'
+                            break
+        
+        # Extract pressur_bal from DECOSUBCODE03
+        subcode03 = element_data.get('DECOSUBCODE03', '').strip()
+        if subcode03 and subcode03 != 'N/A' and subcode03 != 'None':
+            if 'PRESSURBAL' in subcode03.upper():
+                match = re.search(r'PRESSURBAL\s*(\d+)', subcode03.upper())
+                pressur_bal = match.group(1) if match else subcode03
+            else:
+                pressur_bal = subcode03
+        
+        # Defaults
+        if pressur_bal is None:
+            pressur_bal = '1'
+        if pl1 is None:
+            pl1 = '1'
+        if not packing_sequence or packing_sequence == 'None':
+            packing_sequence = pl1
+        
+        # ========== BUILD FOLDER STRUCTURE ==========
+        # Clean values
+        pressur_bal_clean = re.sub(r'\D', '', str(pressur_bal)) or '1'
+        
+        # Use packing_sequence for box folder
+        if packing_sequence and packing_sequence != 'N/A' and packing_sequence != 'None':
+            box_folder_value = re.sub(r'[^\w\-]', '', packing_sequence).strip()
+            if not box_folder_value:
+                box_folder_value = pl1
+        else:
+            box_folder_value = pl1
+        
+        # Build demand folder with subcode03
+        demand_folder = f"{demand_code}_{subcode03}" if subcode03 else demand_code
+        
+        # Build the full folder structure
+        folder_path = f"{customer_slug}--{po_clean}/{order_code}/{demand_folder}/PALLET_{pallet_clean}_{subcode03}/BOX_{box_clean}_{box_folder_value}"
+        
+        logger.info(f"✅ Generated folder path: {folder_path}")
+        return folder_path, True, "Folder path built successfully"
+        
+    except Exception as e:
+        logger.error(f"❌ Error building folder path: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return None, False, f"Error: {str(e)}"
+
+
+# ---------------------- FETCH DATA (UPDATED) ----------------------
+def fetch_data(request):
+    if request.method == 'POST':
+        production_order_code = request.POST.get('production_order_code', '').strip()
+        production_demand_code = request.POST.get('production_demand_code', '').strip()
+        pallet_number = request.POST.get('pallet_number', '1').strip()
+        box_number = request.POST.get('box_number', '1').strip()
+
+        customer_data = fetch_customer_data(production_order_code, production_demand_code)
+        product_details = fetch_product_details(production_order_code, production_demand_code)
+        kit_elements = fetch_kit_elements(production_order_code, production_demand_code, pallet_number, box_number)
+        
+        # Extract PressurBal, PL1 and packing_sequence with kit_elements
+        pressur_bal, pl1, packing_sequence = extract_pressur_bal_and_pl1(product_details, kit_elements)
+        print(f"Extracted PressurBal: {pressur_bal}, PL1: {pl1}, PackingSeq: {packing_sequence}")
+        
+        if product_details:
+            product_details['PressurBal'] = pressur_bal
+            product_details['PL1'] = pl1
+            product_details['PackingSequence'] = packing_sequence
+
+        # Process each element
+        for element in kit_elements:
+            folder_structure, element_slug = build_image_url(
+                element, 
+                customer_data if customer_data else {}, 
+                product_details if product_details else {}, 
+                production_order_code, 
+                production_demand_code, 
+                pallet_number, 
+                box_number,
+                kit_elements
+            )
+            
+            element['folder_structure'] = folder_structure
+            
+            element_desc = element.get('ELEMENTDESC', '').strip()
+            
+            # ========== CHECK IF TXT FILE EXISTS IN DESTINATION ==========
+            dest_base = Path(DESTINATION_BASE)
+            dest_folder = dest_base / folder_structure
+            txt_file_path = dest_folder / f"{element_desc}.txt"
+            element['txt_file_exists'] = txt_file_path.exists()
+            
+            print(f"========== TXT FILE CHECK ==========")
+            print(f"Element: {element_desc}")
+            print(f"Destination path: {txt_file_path}")
+            print(f"Exists: {element['txt_file_exists']}")
+            print(f"====================================")
+            
+            image_url = check_image_exists(folder_structure, element_slug, element_desc)
+            if image_url:
+                element['image_url'] = image_url
+                element['has_image'] = True
+            else:
+                element['image_url'] = None
+                element['has_image'] = False
+        
+        # Process human images
+        for element in kit_elements:
+            current_ply = element.get('ELEMENTDESC', '').strip()
+            
+            if current_ply:
+                folder_structure = element.get('folder_structure', '')
+                
+                if not folder_structure:
+                    folder_structure, _ = build_image_url(
+                        element, 
+                        customer_data if customer_data else {}, 
+                        product_details if product_details else {}, 
+                        production_order_code, 
+                        production_demand_code, 
+                        pallet_number, 
+                        box_number,
+                        kit_elements
+                    )
+                
+                human_image_url = check_human_image_exists(folder_structure, current_ply)
+                
+                element['human_image_url'] = human_image_url
+                element['has_human_image'] = human_image_url is not None
+                element['human_folder'] = folder_structure
+            else:
+                element['human_image_url'] = None
+                element['has_human_image'] = False
+
+        context = {
+            'customer_data': customer_data if customer_data else {
+                'CustomerName': 'Not Available',
+                'CustomerPO': 'Not Available',
+                'CustomerCode': 'Not Available'
+            },
             'product_details': product_details if product_details else {
                 'ItemType': 'Not Available',
                 'Subcode01': 'N/A',
@@ -272,7 +1824,8 @@ def fetch_data(request):
             'pallet_number': pallet_number,
             'box_number': box_number,
             'packing_sequence': packing_sequence,
-            'MEDIA_URL': settings.MEDIA_URL
+            'MEDIA_URL': settings.MEDIA_URL,
+            'DESTINATION_BASE': DESTINATION_BASE,
         }
 
         if not any([customer_data, product_details, kit_elements]):
@@ -284,211 +1837,464 @@ def fetch_data(request):
     return render(request, 'fetch_data.html')
 
 
-# ---------------------- UPDATED: VIEW DATA ----------------------
-def view_data(request):
-    if request.method == 'POST':
+# ---------------------- MOVE TXT FILES (UPDATED) ----------------------
+def move_txt_files(production_order_code=None, production_demand_code=None, pallet_number=None, box_number=None):
+    """
+    Main function to move text files from source to destination
+    
+    Args:
+        production_order_code: Order code from UI (REQUIRED for UI call)
+        production_demand_code: Demand code from UI (REQUIRED for UI call)
+        pallet_number: Pallet number from UI (optional)
+        box_number: Box number from UI (optional)
+    """
+    source_path = Path(SOURCE_DIR)
+    dest_base = Path(DESTINATION_BASE)
+    
+    # Validate directories
+    if not source_path.exists():
+        logger.error(f"Source directory not found: {SOURCE_DIR}")
+        return False
+    
+    if not dest_base.exists():
+        logger.error(f"Destination base directory not found: {DESTINATION_BASE}")
+        try:
+            dest_base.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Created destination directory: {DESTINATION_BASE}")
+        except Exception as e:
+            logger.error(f"Could not create destination directory: {e}")
+            return False
+    
+    # Find all .txt files
+    txt_files = list(source_path.glob('*.txt'))
+    
+    if not txt_files:
+        logger.info("No .txt files found in source directory")
+        return True
+    
+    logger.info(f"Found {len(txt_files)} .txt files to process")
+    
+    # Check if UI parameters are provided
+    if production_order_code and production_demand_code:
+        logger.info(f"✅ Using order: {production_order_code}, demand: {production_demand_code} from UI")
+        logger.info(f"✅ Using pallet: {pallet_number}, box: {box_number} from UI")
+        use_ui_params = True
+    else:
+        logger.warning("⚠️ No UI parameters provided! This should only happen from scheduler.")
+        logger.warning("⚠️ Scheduler will try to use DECOSUBCODE01 and DECOSUBCODE02 from database.")
+        use_ui_params = False
+    
+    moved_count = 0
+    failed_count = 0
+    skipped_count = 0
+    
+    for file_path in txt_files:
+        file_name = file_path.stem
+        
+        logger.info(f"Processing: {file_name}")
+        
+        try:
+            # Check if element exists in SKP_KITUPLOAD
+            element_data = get_element_data_from_db(file_name)
+            
+            if not element_data:
+                logger.info(f"Element '{file_name}' not found in database. Skipping.")
+                skipped_count += 1
+                continue
+            
+            logger.info(f"Found data for {file_name}:")
+            logger.info(f"  PALLETNUMBER: {element_data.get('PALLETNUMBER')}")
+            logger.info(f"  BOXNUMBER: {element_data.get('BOXNUMBER')}")
+            logger.info(f"  PACKINGSEQUENCE: {element_data.get('PACKINGSEQUENCE')}")
+            logger.info(f"  DECOSUBCODE01: {element_data.get('DECOSUBCODE01')}")
+            logger.info(f"  DECOSUBCODE02: {element_data.get('DECOSUBCODE02')}")
+            logger.info(f"  DECOSUBCODE03: {element_data.get('DECOSUBCODE03')}")
+            
+            # Build folder path
+            if use_ui_params:
+                # Use UI parameters
+                folder_path, success, message = build_folder_path_for_element(
+                    element_data, 
+                    production_order_code, 
+                    production_demand_code,
+                    pallet_number,
+                    box_number
+                )
+            else:
+                # Scheduler mode - try to use subcodes from database
+                # Get order and demand from subcodes
+                db_order = element_data.get('DECOSUBCODE01', '').strip()
+                db_demand = element_data.get('DECOSUBCODE02', '').strip()
+                
+                if db_order and db_demand:
+                    logger.info(f"Using order from DB subcode: {db_order}, demand: {db_demand}")
+                    folder_path, success, message = build_folder_path_for_element(
+                        element_data,
+                        db_order,
+                        db_demand,
+                        element_data.get('PALLETNUMBER', '1'),
+                        element_data.get('BOXNUMBER', '1')
+                    )
+                else:
+                    logger.error(f"No order/demand found in database for {file_name}")
+                    failed_count += 1
+                    continue
+            
+            if not success:
+                logger.warning(f"Could not build folder path for {file_name}: {message}")
+                failed_count += 1
+                continue
+            
+            # Full destination path
+            dest_folder = dest_base / folder_path
+            dest_file_path = dest_folder / file_path.name
+            
+            # Create destination folder
+            try:
+                dest_folder.mkdir(parents=True, exist_ok=True)
+                logger.info(f"Created/Verified folder: {dest_folder}")
+            except Exception as e:
+                logger.error(f"Could not create destination folder: {e}")
+                failed_count += 1
+                continue
+            
+            # Handle duplicate files
+            if dest_file_path.exists():
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                new_name = f"{file_path.stem}_{timestamp}.txt"
+                dest_file_path = dest_folder / new_name
+                logger.info(f"File exists, renaming to: {new_name}")
+            
+            # Move the file
+            try:
+                shutil.move(str(file_path), str(dest_file_path))
+                moved_count += 1
+                logger.info(f"✓ Moved: {file_path.name} -> {dest_folder.relative_to(dest_base)}")
+            except Exception as e:
+                logger.error(f"Error moving file: {e}")
+                failed_count += 1
+            
+        except Exception as e:
+            logger.error(f"Error processing {file_path.name}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            failed_count += 1
+    
+    # Summary
+    logger.info("=" * 60)
+    logger.info(f"✅ Successfully moved: {moved_count} files")
+    logger.info(f"⏭️ Skipped (not in DB): {skipped_count} files")
+    logger.info(f"❌ Failed: {failed_count} files")
+    logger.info("=" * 60)
+    
+    return moved_count > 0
+
+# ---------------------- ENDPOINT TO MOVE TXT FILES FROM UI ----------------------
+@csrf_exempt
+@require_POST
+def move_txt_files_endpoint(request):
+    """
+    Django endpoint to trigger moving text files with UI parameters
+    """
+    try:
+        # Get parameters from request (from UI)
         production_order_code = request.POST.get('production_order_code', '').strip()
         production_demand_code = request.POST.get('production_demand_code', '').strip()
         pallet_number = request.POST.get('pallet_number', '1').strip()
         box_number = request.POST.get('box_number', '1').strip()
-
-        customer_data = fetch_customer_data(production_order_code, production_demand_code)
-        product_details = fetch_product_details(production_order_code, production_demand_code)
-        kit_elements = fetch_kit_elements(production_order_code, production_demand_code, pallet_number, box_number)
+        specific_file = request.POST.get('file_name', '').strip()
         
-        # Get customer info with order/demand
-        customer_info = get_customer_data_with_order_demand(production_order_code, production_demand_code)
+        logger.info(f"[MOVE ENDPOINT] 📥 Received from UI - Order: {production_order_code}, Demand: {production_demand_code}")
+        logger.info(f"[MOVE ENDPOINT] 📥 Received from UI - Pallet: {pallet_number}, Box: {box_number}")
         
-        # Extract PressurBal, PL1 and packing_sequence
-        pressur_bal, pl1, packing_sequence = extract_pressur_bal_and_pl1(product_details, kit_elements)
+        # Validate required fields
+        if not production_order_code or not production_demand_code:
+            return JsonResponse({
+                'status': 'error',
+                'message': 'Order code and Demand code are required'
+            }, status=400)
         
-        if product_details:
-            product_details['PressurBal'] = pressur_bal
-            product_details['PL1'] = pl1
-            product_details['PackingSequence'] = packing_sequence
-
-        for element in kit_elements:
-            folder_structure, element_slug = build_image_url(
-                element, 
-                customer_data if customer_data else {}, 
-                product_details if product_details else {}, 
+        if specific_file:
+            # Process only specific file
+            source_path = Path(SOURCE_DIR) / f"{specific_file}.txt"
+            
+            if not source_path.exists():
+                return JsonResponse({
+                    'status': 'error',
+                    'message': f'File not found: {specific_file}.txt'
+                }, status=404)
+            
+            # Check if element exists in database
+            element_data = get_element_data_from_db(specific_file)
+            
+            if not element_data:
+                return JsonResponse({
+                    'status': 'error',
+                    'message': f'Element not found in database: {specific_file}'
+                }, status=404)
+            
+            # Build folder path with UI parameters
+            folder_path, success, message = build_folder_path_for_element(
+                element_data,
+                production_order_code,
+                production_demand_code,
+                pallet_number,
+                box_number
+            )
+            
+            if not success:
+                return JsonResponse({
+                    'status': 'error',
+                    'message': message
+                }, status=400)
+            
+            # Move the file
+            dest_base = Path(DESTINATION_BASE)
+            dest_folder = dest_base / folder_path
+            dest_file_path = dest_folder / f"{specific_file}.txt"
+            
+            dest_folder.mkdir(parents=True, exist_ok=True)
+            
+            if dest_file_path.exists():
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                new_name = f"{specific_file}_{timestamp}.txt"
+                dest_file_path = dest_folder / new_name
+            
+            shutil.move(str(source_path), str(dest_file_path))
+            
+            return JsonResponse({
+                'status': 'success',
+                'message': f'File moved successfully',
+                'source': str(source_path),
+                'destination': str(dest_file_path),
+                'folder': str(folder_path)
+            })
+        else:
+            # Move all files with UI parameters
+            success = move_txt_files(
                 production_order_code, 
                 production_demand_code, 
                 pallet_number, 
-                box_number,
-                kit_elements
+                box_number
             )
+            return JsonResponse({
+                'status': 'success' if success else 'error',
+                'message': 'File move operation completed'
+            })
             
-            element['folder_structure'] = folder_structure
-            
-            element_desc = element.get('ELEMENTDESC', '').strip()
-            image_url = check_image_exists(folder_structure, element_desc, element_desc)
-            if image_url:
-                element['image_url'] = image_url
-                element['has_image'] = True
-            else:
-                element['image_url'] = None
-                element['has_image'] = False
+    except Exception as e:
+        logger.error(f"Error in move_txt_files_endpoint: {str(e)}")
+        return JsonResponse({
+            'status': 'error',
+            'message': f"Server error: {str(e)}"
+        }, status=500)
+
+# ---------------------- SCHEDULER JOB FUNCTION ----------------------
+def check_and_process_txt_files():
+    """
+    Function to be called by scheduler to check and process txt files
+    This version uses database subcodes as fallback
+    """
+    try:
+        logger.info("[FILE_MONITOR] 🔍 Checking for txt files...")
+        # Call without UI parameters - will use database subcodes
+        success = move_txt_files()  # No parameters = use database subcodes
+        if success:
+            logger.info("[FILE_MONITOR] ✅ File processing completed successfully")
+        else:
+            logger.warning("[FILE_MONITOR] ⚠️ File processing completed with issues")
+        return success
+    except Exception as e:
+        logger.error(f"[FILE_MONITOR] Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+# ---------------------- SCHEDULER MANAGEMENT ENDPOINTS ----------------------
+@csrf_exempt
+@require_GET
+def scheduler_status(request):
+    """
+    Get the current status of the background file monitor scheduler
+    """
+    try:
+        from .scheduler import get_scheduler_status
+        status = get_scheduler_status()
+        return JsonResponse({
+            'status': 'success',
+            'scheduler': status
+        })
+    except Exception as e:
+        return JsonResponse({
+            'status': 'error',
+            'message': str(e)
+        }, status=500)
+
+@csrf_exempt
+@require_POST
+def trigger_file_check_now(request):
+    """
+    Manually trigger the file check immediately
+    (In addition to the automatic 5-minute interval check)
+    """
+    try:
+        from .scheduler import check_and_process_txt_files
+        check_and_process_txt_files()
+        return JsonResponse({
+            'status': 'success',
+            'message': 'File check triggered successfully'
+        })
+    except Exception as e:
+        logger.error(f"[MANUAL CHECK ERROR] {str(e)}")
+        return JsonResponse({
+            'status': 'error',
+            'message': str(e)
+        }, status=500)
+
+@csrf_exempt
+@require_POST
+def update_check_interval(request):
+    """
+    Update the interval (in minutes) for the background file check
+    Default: 5 minutes
+    
+    POST parameter: interval (in minutes)
+    """
+    try:
+        from .scheduler import _scheduler
         
-        # Process each element's human image separately
-        for element in kit_elements:
-            current_ply = element.get('ELEMENTDESC', '').strip()
-            
-            if current_ply:
-                folder_structure = element.get('folder_structure', '')
-                
-                if not folder_structure:
-                    folder_structure, _ = build_image_url(
-                        element, 
-                        customer_data if customer_data else {}, 
-                        product_details if product_details else {}, 
-                        production_order_code, 
-                        production_demand_code, 
-                        pallet_number, 
-                        box_number,
-                        kit_elements
-                    )
-                
-                human_image_url = check_human_image_exists(folder_structure, current_ply)
-                
-                element['human_image_url'] = human_image_url
-                element['has_human_image'] = human_image_url is not None
-                element['human_folder'] = folder_structure
-            else:
-                element['human_image_url'] = None
-                element['has_human_image'] = False
-
-        # Use customer_info for display
-        display_customer = {
-            'CustomerName': customer_info.get('CustomerName', 'Not Available'),
-            'CustomerPO': customer_info.get('CustomerPO', 'Not Available'),
-            'CustomerCode': customer_data.get('CustomerCode', 'Not Available') if customer_data else 'Not Available'
-        }
-
-        context = {
-            'customer_data': display_customer,
-            'product_details': product_details if product_details else {
-                'ItemType': 'Not Available',
-                'Subcode01': 'N/A',
-                'Subcode02': 'N/A',
-                'Subcode03': 'N/A',
-                'Subcode04': 'N/A',
-                'Subcode05': 'N/A',
-                'PressurBal': '',
-                'PL1': '1',
-                'PackingSequence': ''
-            },
-            'kit_elements': kit_elements or [],
-            'production_order_code': production_order_code,
-            'production_demand_code': production_demand_code,
-            'pallet_number': pallet_number,
-            'box_number': box_number,
-            'packing_sequence': packing_sequence,
-            'MEDIA_URL': settings.MEDIA_URL
-        }
-
-        return render(request, 'view_data.html', context)
-
-    # GET request handling
-    production_order_code = request.GET.get('production_order_code', '').strip()
-    production_demand_code = request.GET.get('production_demand_code', '').strip()
-    pallet_number = request.GET.get('pallet_number', '1').strip()
-    box_number = request.GET.get('box_number', '1').strip()
-
-    if production_order_code and production_demand_code:
-        customer_data = fetch_customer_data(production_order_code, production_demand_code)
-        product_details = fetch_product_details(production_order_code, production_demand_code)
-        kit_elements = fetch_kit_elements(production_order_code, production_demand_code, pallet_number, box_number)
+        interval = request.POST.get('interval', '5').strip()
         
-        # Get customer info with order/demand
-        customer_info = get_customer_data_with_order_demand(production_order_code, production_demand_code)
+        try:
+            interval = int(interval)
+            if interval < 1:
+                return JsonResponse({
+                    'status': 'error',
+                    'message': 'Interval must be at least 1 minute'
+                }, status=400)
+        except ValueError:
+            return JsonResponse({
+                'status': 'error',
+                'message': 'Interval must be a valid integer'
+            }, status=400)
         
-        pressur_bal, pl1, packing_sequence = extract_pressur_bal_and_pl1(product_details, kit_elements)
+        if not _scheduler or not _scheduler.running:
+            return JsonResponse({
+                'status': 'error',
+                'message': 'Scheduler is not running'
+            }, status=500)
         
-        if product_details:
-            product_details['PressurBal'] = pressur_bal
-            product_details['PL1'] = pl1
-            product_details['PackingSequence'] = packing_sequence
-
-        for element in kit_elements:
-            folder_structure, element_slug = build_image_url(
-                element, 
-                customer_data if customer_data else {}, 
-                product_details if product_details else {}, 
-                production_order_code, 
-                production_demand_code, 
-                pallet_number, 
-                box_number,
-                kit_elements
-            )
-            
-            element['folder_structure'] = folder_structure
-            
-            element_desc = element.get('ELEMENTDESC', '').strip()
-            image_url = check_image_exists(folder_structure, element_desc, element_desc)
-            if image_url:
-                element['image_url'] = image_url
-                element['has_image'] = True
-            else:
-                element['image_url'] = None
-                element['has_image'] = False
+        # Reschedule the job with new interval
+        _scheduler.reschedule_job('txt_file_monitor', trigger='interval', minutes=interval)
         
-        for element in kit_elements:
-            current_ply = element.get('ELEMENTDESC', '').strip()
+        return JsonResponse({
+            'status': 'success',
+            'message': f'Check interval updated to {interval} minute(s)',
+            'new_interval': interval
+        })
+        
+    except Exception as e:
+        logger.error(f"[INTERVAL UPDATE ERROR] {str(e)}")
+        return JsonResponse({
+            'status': 'error',
+            'message': str(e)
+        }, status=500)
+
+# ---------------------- TEST ELEMENT LOOKUP ENDPOINT ----------------------
+@csrf_exempt
+@require_GET
+def test_element_lookup(request):
+    """
+    Test endpoint to check if an element exists in database
+    """
+    try:
+        element_desc = request.GET.get('element_desc', '').strip()
+        
+        if not element_desc:
+            return JsonResponse({
+                'status': 'error',
+                'message': 'element_desc parameter required'
+            }, status=400)
+        
+        # Check if element exists in database
+        element_data = get_element_data_from_db(element_desc)
+        
+        if element_data:
+            return JsonResponse({
+                'status': 'success',
+                'found': True,
+                'data': element_data
+            })
+        else:
+            return JsonResponse({
+                'status': 'success',
+                'found': False,
+                'message': f'Element not found: {element_desc}'
+            })
             
-            if current_ply:
-                folder_structure = element.get('folder_structure', '')
-                
-                if not folder_structure:
-                    folder_structure, _ = build_image_url(
-                        element, 
-                        customer_data if customer_data else {}, 
-                        product_details if product_details else {}, 
-                        production_order_code, 
-                        production_demand_code, 
-                        pallet_number, 
-                        box_number,
-                        kit_elements
-                    )
-                
-                human_image_url = check_human_image_exists(folder_structure, current_ply)
-                
-                element['human_image_url'] = human_image_url
-                element['has_human_image'] = human_image_url is not None
-                element['human_folder'] = folder_structure
-            else:
-                element['human_image_url'] = None
-                element['has_human_image'] = False
+    except Exception as e:
+        logger.error(f"Error in test_element_lookup: {str(e)}")
+        return JsonResponse({
+            'status': 'error',
+            'message': f"Server error: {str(e)}"
+        }, status=500)
 
-        # Use customer_info for display
-        display_customer = {
-            'CustomerName': customer_info.get('CustomerName', 'Not Available'),
-            'CustomerPO': customer_info.get('CustomerPO', 'Not Available'),
-            'CustomerCode': customer_data.get('CustomerCode', 'Not Available') if customer_data else 'Not Available'
-        }
-
-        context = {
-            'customer_data': display_customer,
-            'product_details': product_details if product_details else {
-                'ItemType': 'Not Available',
-                'Subcode01': 'N/A',
-                'Subcode02': 'N/A',
-                'Subcode03': 'N/A',
-                'Subcode04': 'N/A',
-                'Subcode05': 'N/A',
-                'PressurBal': '',
-                'PL1': '1',
-                'PackingSequence': ''
-            },
-            'kit_elements': kit_elements or [],
-            'production_order_code': production_order_code,
-            'production_demand_code': production_demand_code,
-            'pallet_number': pallet_number,
-            'box_number': box_number,
-            'packing_sequence': packing_sequence,
-            'MEDIA_URL': settings.MEDIA_URL
-        }
-
-        return render(request, 'view_data.html', context)
-
-    return render(request, 'fetch_data.html')
+# ---------------------- UPLOAD BOX CAPTURE ----------------------
+@csrf_exempt
+@require_POST
+def upload_box_capture(request):
+    try:
+        # Get image
+        image_data = request.POST.get("box_image")
+        
+        if not image_data:
+            return JsonResponse({
+                "status": "error",
+                "message": "No image received."
+            })
+        
+        # Get order information
+        production_order_code = request.POST.get("production_order_code", "UNKNOWN_ORDER")
+        production_demand_code = request.POST.get("production_demand_code", "UNKNOWN_DEMAND")
+        pallet_number = request.POST.get("pallet_number", "UNKNOWN_PALLET")
+        box_number = request.POST.get("box_number", "UNKNOWN_BOX")
+        
+        # Create folder if it doesn't exist
+        os.makedirs(settings.MEDIA_ROOT, exist_ok=True)
+        
+        # Remove base64 prefix if present
+        if "," in image_data:
+            image_data = image_data.split(",", 1)[1]
+        
+        # Decode image
+        image_bytes = base64.b64decode(image_data)
+        
+        filename = f"{production_order_code}_{production_demand_code}_Pallet_{pallet_number}_Box_{box_number}.jpg"
+        
+        # Remove invalid Windows filename characters
+        invalid_chars = '<>:"/\\|?*'
+        for char in invalid_chars:
+            filename = filename.replace(char, "_")
+        
+        # Full path
+        file_path = os.path.join(settings.MEDIA_ROOT, filename)
+        
+        # Save image
+        with open(file_path, "wb") as image_file:
+            image_file.write(image_bytes)
+        
+        print("✅ Box image saved:", file_path)
+        
+        return JsonResponse({
+            "status": "success",
+            "message": "Box image uploaded successfully.",
+            "filepath": file_path,
+            "filename": filename
+        })
+        
+    except Exception as e:
+        print("❌ Box image upload error:", str(e))
+        return JsonResponse({
+            "status": "error",
+            "message": str(e)
+        }, status=500)
